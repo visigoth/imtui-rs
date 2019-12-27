@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "imtui-sys"
+]
+
+exclude = [
+    "imtui-examples",
+    "imtui-sys-bindgen"
+]
