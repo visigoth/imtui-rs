@@ -8,6 +8,7 @@ edition = "2018"
 readme = "README.md"
 
 [dependencies]
+imtui-sys = { version = "0.1.0", path = "imtui-sys" }
 
 [workspace]
 members = [
