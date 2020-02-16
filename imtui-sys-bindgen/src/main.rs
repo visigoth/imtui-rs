@@ -10,9 +10,9 @@ fn main() {
         .canonicalize()
         .expect("Failed to find imtui");
     let imgui_path = cwd
-        .join("../imgui-rs/imgui-sys/third-party/cimgui/imgui")
+        .join("include")
         .canonicalize()
-        .expect("Failed to find imgui");
+        .expect("Failed to find local include path");
     let bindings = generate_bindings(imtui_path.as_path(), imgui_path.as_path())
         .expect("Failed to generate bindings");
     let output_path = cwd.join("../imtui-sys/src/bindings.rs");
