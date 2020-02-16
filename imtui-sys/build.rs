@@ -1,6 +1,8 @@
 use std::io;
 
 fn main() -> io::Result<()> {
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+
     let mut build = cc::Build::new();
     let files = vec![
         "third-party/imtui/src/imtui-impl-text.cpp",
@@ -13,5 +15,7 @@ fn main() -> io::Result<()> {
         .flag("-std=c++17")
         .files(files.iter())
         .compile("libimtui.a");
+
+    println!("cargo:rustc-link-lib=ncurses");
     Ok(())
 }
