@@ -9,8 +9,8 @@ fn main() {
     imgui.set_ini_filename(None);
 
     unsafe {
-        let mut screen = imtui::sys::root::ImTui_ImplNcurses_Init(false, 60.0, -1.0);
-        imtui::sys::root::ImTui_ImplText_Init();
+        let screen = imtui::sys::ImTui_ImplNcurses_Init(false, 60.0, -1.0);
+        imtui::sys::ImTui_ImplText_Init();
 
         let now = SystemTime::now();
         let mut nframes = 0 as i32;
@@ -20,8 +20,8 @@ fn main() {
                 break;
             }
 
-            imtui::sys::root::ImTui_ImplNcurses_NewFrame();
-            imtui::sys::root::ImTui_ImplText_NewFrame();
+            imtui::sys::ImTui_ImplNcurses_NewFrame();
+            imtui::sys::ImTui_ImplText_NewFrame();
 
             imgui::sys::igNewFrame();
 
@@ -36,11 +36,11 @@ fn main() {
             imgui::sys::igText(s2.as_ptr(), nframes);
 
             let s3 = std::ffi::CString::new("Mouse Pos : x = %g, y = %g").expect("");
-            let imguiIo = *imgui::sys::igGetIO();
-            imgui::sys::igText(s3.as_ptr(), imguiIo.MousePos.x as os::raw::c_double, imguiIo.MousePos.y as os::raw::c_double);
+            let imgui_io = *imgui::sys::igGetIO();
+            imgui::sys::igText(s3.as_ptr(), imgui_io.MousePos.x as os::raw::c_double, imgui_io.MousePos.y as os::raw::c_double);
 
             let s4 = std::ffi::CString::new("Time per frame %.3f ms/frame (%.1f FPS)").expect("");
-            imgui::sys::igText(s4.as_ptr(), 1000.0 / imguiIo.Framerate as os::raw::c_double, imguiIo.Framerate as os::raw::c_double);
+            imgui::sys::igText(s4.as_ptr(), 1000.0 / imgui_io.Framerate as os::raw::c_double, imgui_io.Framerate as os::raw::c_double);
 
             let s5 = std::ffi::CString::new("Float:").expect("");
             imgui::sys::igText(s5.as_ptr());
@@ -55,10 +55,10 @@ fn main() {
 
             imgui::sys::igRender();
 
-            imtui::sys::root::ImTui_ImplText_RenderDrawData(imgui::sys::igGetDrawData(), screen);
-            imtui::sys::root::ImTui_ImplNcurses_DrawScreen(true);
+            imtui::sys::ImTui_ImplText_RenderDrawData(imgui::sys::igGetDrawData(), screen);
+            imtui::sys::ImTui_ImplNcurses_DrawScreen(true);
         }
 
-        imtui::sys::root::ImTui_ImplNcurses_Shutdown();
+        imtui::sys::ImTui_ImplNcurses_Shutdown();
     }
 }

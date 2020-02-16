@@ -1,1 +1,1 @@
-pub extern crate imtui_sys as sys;
+pub use imtui_sys::root as sys;
