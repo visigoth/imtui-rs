@@ -7,7 +7,7 @@ fn main() {
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
 
-    let mut imtui = imtui::Ncurses::init(false, 60.0, -1.0);
+    let mut imtui = imtui::Ncurses::init(true, 60.0, -1.0);
     let now = SystemTime::now();
     let mut nframes = 0 as i32;
     let mut fval = 123.0;
