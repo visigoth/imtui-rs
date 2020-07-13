@@ -9,3 +9,8 @@ publish = false
 [dev-dependencies]
 imtui = { version = "0.1.0", path = "../" }
 imgui = { version = "0.2.1", path = "../imgui-rs" }
+
+[dependencies]
+variant_count = "*"
+lazy_static = "1.4.0"
+maplit = "*"
