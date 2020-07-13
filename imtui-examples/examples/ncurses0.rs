@@ -20,8 +20,8 @@ fn main() {
         let ui = imgui.frame();
         let title = imgui::ImString::new("Hello, world!");
         let window = imgui::Window::new(&title)
-            .position([0.0, 0.0], imgui::Condition::Always)
-            .size([50.0, 10.0], imgui::Condition::Always);
+            .position([0.0, 0.0], imgui::Condition::FirstUseEver)
+            .size([50.0, 10.0], imgui::Condition::FirstUseEver);
         if let Some(windowToken) = window.begin(&ui) {
             ui.text(format!("NFrames = {}", nframes));
 
