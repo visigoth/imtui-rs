@@ -52,11 +52,26 @@ struct WindowData {
 }
 
 impl WindowData {
-    fn render(&mut self, draw_context: &DrawContext) {
+    fn new(window_content: WindowContent) -> WindowData {
+        WindowData {
+            window_content: window_content,
+            show_comments: false,
+            id: 0,
+            kids: vec![],
+            score: 0,
+            time: 0,
+            text: String::from(""),
+            title: String::from("[Y] Hacker News"),
+            url: String::from(""),
+            domain: String::from(""),
+        }
+    }
+
+    fn render(&mut self, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
         let title = imgui::ImString::new("[Y] Hacker News");
         let window = imgui::Window::new(&title)
-            .position([0.0, 0.0], imgui::Condition::Always)
-            .size(draw_context.ui.io().display_size, imgui::Condition::Always)
+            .position([pos.0, pos.1], imgui::Condition::Always)
+            .size([size.0, size.1], imgui::Condition::Always)
             .flags(imgui::WindowFlags::NO_COLLAPSE |
                    imgui::WindowFlags::NO_RESIZE |
                    imgui::WindowFlags::NO_MOVE |
@@ -89,11 +104,17 @@ struct HntermApp {
 impl AppState {
     fn new() -> AppState {
         AppState {
-            windows: Vec::new()
+            windows: vec![
+                WindowData::new(WindowContent::Top),
+            ]
         }
     }
 
     fn process_input(&mut self, ui: &imgui::Ui) -> bool {
+        if ui.is_key_pressed('+' as u32) && self.windows.len() < 3 {
+            self.windows.push(WindowData::new(WindowContent::Top))
+        }
+
         !ui.is_key_pressed('q' as u32)
     }
 }
@@ -117,13 +138,19 @@ impl HntermApp {
         }
 
         {
+            let display_size = ui.io().display_size;
+            let window_width = display_size[0] / self.state.windows.len() as f32;
+            let window_size = (window_width, display_size[1]);
+
             let draw_context = DrawContext {
                 imtui: &self.imtui,
                 ui: &mut ui,
             };
 
+            let mut window_pos = (0.0, 0.0);
             for wd in self.state.windows.iter_mut() {
-                wd.render(&draw_context);
+                wd.render(&draw_context, &window_pos, &window_size);
+                window_pos.0 += window_width;
             }
         }
 
