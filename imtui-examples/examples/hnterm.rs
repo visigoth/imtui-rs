@@ -8,6 +8,7 @@ use imtui;
 use imgui;
 use variant_count::VariantCount;
 use std::collections::HashMap;
+use std::vec::Vec;
 
 mod hn;
 
@@ -20,7 +21,7 @@ enum WindowContent {
 }
 
 lazy_static! {
-    static ref ContentTitle: HashMap<WindowContent, &'static str> = {
+    static ref CONTENT_TITLE_MAP: HashMap<WindowContent, &'static str> = {
         hashmap! {
             WindowContent::Top => "Top",
             WindowContent::Show => "Show",
@@ -37,17 +38,99 @@ enum StoryListMode {
     Spread,
 }
 
-struct WindowData<'a> {
+struct WindowData {
     window_content: WindowContent,
     show_comments: bool,
     id: hn::ItemId,
     kids: hn::ItemIds,
     score: u32,
     time: u64,
-    text: &'a str,
-    title: &'a str,
-    url: &'a str,
-    domain: &'a str,
+    text: String,
+    title: String,
+    url: String,
+    domain: String,
+}
+
+impl WindowData {
+    fn render(&mut self, draw_context: &DrawContext) {
+        let title = imgui::ImString::new("[Y] Hacker News");
+        let window = imgui::Window::new(&title)
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .size(draw_context.ui.io().display_size, imgui::Condition::Always)
+            .flags(imgui::WindowFlags::NO_COLLAPSE |
+                   imgui::WindowFlags::NO_RESIZE |
+                   imgui::WindowFlags::NO_MOVE |
+                   imgui::WindowFlags::NO_SCROLLBAR);
+        if let Some(window_token) = window.begin(draw_context.ui) {
+            // Blank line
+            draw_context.ui.text("");
+
+            // Draw a specific story or draw the index
+            window_token.end(draw_context.ui);
+        }
+    }
+}
+
+struct DrawContext<'a, 'b> {
+    imtui: &'a imtui::Ncurses,
+    ui: &'a mut imgui::Ui<'b>,
+}
+
+struct AppState {
+    windows: Vec<WindowData>
+}
+
+struct HntermApp {
+    imgui: imgui::Context,
+    imtui: imtui::Ncurses,
+    state: AppState,
+}
+
+impl AppState {
+    fn new() -> AppState {
+        AppState {
+            windows: Vec::new()
+        }
+    }
+
+    fn process_input(&mut self, ui: &imgui::Ui) -> bool {
+        !ui.is_key_pressed('q' as u32)
+    }
+}
+
+impl HntermApp {
+    fn new(imgui: imgui::Context, imtui: imtui::Ncurses) -> HntermApp {
+        HntermApp {
+            imgui,
+            imtui,
+            state: AppState::new(),
+        }
+    }
+
+    fn process_frame(&mut self) -> bool {
+        self.imtui.set_active();
+        self.imtui.new_frame();
+
+        let mut ui = self.imgui.frame();
+        if !self.state.process_input(&ui) {
+            return false;
+        }
+
+        {
+            let draw_context = DrawContext {
+                imtui: &self.imtui,
+                ui: &mut ui,
+            };
+
+            for wd in self.state.windows.iter_mut() {
+                wd.render(&draw_context);
+            }
+        }
+
+        let draw_data = ui.render();
+        self.imtui.render(draw_data);
+        true
+    }
 }
 
 fn set_color_scheme(context: &mut imgui::Context, dark: bool) {
@@ -79,39 +162,13 @@ fn set_color_scheme(context: &mut imgui::Context, dark: bool) {
     }
 }
 
-fn render_frame(context: &mut imgui::Context, imtui: &mut imtui::Ncurses) -> bool {
-    imtui.set_active();
-    imtui.new_frame();
-
-    let ui = context.frame();
-
-    // Only draw 1 window, as opposed to multiple supported by imtui hnterm example
-    let title = imgui::ImString::new("[Y] Hacker News");
-    let window = imgui::Window::new(&title)
-        .position([0.0, 0.0], imgui::Condition::Always)
-        .size(ui.io().display_size, imgui::Condition::Always)
-        .flags(imgui::WindowFlags::NO_COLLAPSE |
-               imgui::WindowFlags::NO_RESIZE |
-               imgui::WindowFlags::NO_MOVE |
-               imgui::WindowFlags::NO_SCROLLBAR);
-    if let Some(window_token) = window.begin(&ui) {
-        // Blank line
-        ui.text("");
-
-        // Draw a specific story or draw the index
-        window_token.end(&ui);
-    }
-    let draw_data = ui.render();
-    imtui.render(draw_data);
-    true
-}
-
 fn main() {
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
-    let mut imtui = imtui::Ncurses::init(true, 60.0, -1.0);
+    let imtui = imtui::Ncurses::init(true, 60.0, -1.0);
 
     set_color_scheme(&mut imgui, false);
-    while render_frame(&mut imgui, &mut imtui) {
-    }
+
+    let mut app = HntermApp::new(imgui, imtui);
+    while app.process_frame() {}
 }
