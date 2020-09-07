@@ -68,7 +68,7 @@ impl WindowData {
     }
 
     fn render(&mut self, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
-        let title = imgui::ImString::new("[Y] Hacker News");
+        let title = imgui::ImString::new(&self.title);
         let window = imgui::Window::new(&title)
             .position([pos.0, pos.1], imgui::Condition::Always)
             .size([size.0, size.1], imgui::Condition::Always)
@@ -148,7 +148,12 @@ impl HntermApp {
             };
 
             let mut window_pos = (0.0, 0.0);
-            for wd in self.state.windows.iter_mut() {
+            for (i, wd) in self.state.windows.iter_mut().enumerate() {
+                wd.title = format!(
+                    "[{}] Hacker News ({})",
+                    i,
+                    CONTENT_TITLE_MAP.get(&wd.window_content).unwrap()
+                );
                 wd.render(&draw_context, &window_pos, &window_size);
                 window_pos.0 += window_width;
             }
