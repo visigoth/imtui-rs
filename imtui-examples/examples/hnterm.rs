@@ -67,7 +67,7 @@ impl WindowData {
         }
     }
 
-    fn render(&mut self, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
+    fn render(&self, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
         let title = imgui::ImString::new(&self.title);
         let window = imgui::Window::new(&title)
             .position([pos.0, pos.1], imgui::Condition::Always)
@@ -106,6 +106,8 @@ impl AppState {
         AppState {
             windows: vec![
                 WindowData::new(WindowContent::Top),
+                WindowData::new(WindowContent::Top),
+                WindowData::new(WindowContent::Top),
             ]
         }
     }
@@ -137,9 +139,16 @@ impl HntermApp {
             return false;
         }
 
+        let display_size = ui.io().display_size;
+        let windows_to_draw = if display_size[0] < 50.0 {
+            &mut self.state.windows.as_mut_slice()[0..1]
+        } else {
+            self.state.windows.as_mut_slice()
+        };
+
         {
             let display_size = ui.io().display_size;
-            let window_width = display_size[0] / self.state.windows.len() as f32;
+            let window_width = display_size[0] / windows_to_draw.len() as f32;
             let window_size = (window_width, display_size[1]);
 
             let draw_context = DrawContext {
@@ -148,14 +157,19 @@ impl HntermApp {
             };
 
             let mut window_pos = (0.0, 0.0);
-            for (i, wd) in self.state.windows.iter_mut().enumerate() {
+            let num_windows = windows_to_draw.len();
+            for (i, wd) in windows_to_draw.iter_mut().enumerate() {
+                let mut actual_window_size = window_size;
+                if i != num_windows - 1 {
+                    actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
+                }
                 wd.title = format!(
                     "[{}] Hacker News ({})",
                     i,
                     CONTENT_TITLE_MAP.get(&wd.window_content).unwrap()
                 );
-                wd.render(&draw_context, &window_pos, &window_size);
-                window_pos.0 += window_width;
+                wd.render(&draw_context, &window_pos, &actual_window_size);
+                window_pos.0 = (window_pos.0 + window_width).round();
             }
         }
 
