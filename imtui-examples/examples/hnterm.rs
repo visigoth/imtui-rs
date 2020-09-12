@@ -185,7 +185,7 @@ impl AppState {
 
     fn update(&mut self) -> bool {
         let now = SystemTime::now();
-        if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0)  {
+        if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0) {
             return false;
         }
 
@@ -257,7 +257,7 @@ impl HntermApp {
                 actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
             }
             wd.render(draw_context, &window_pos, &actual_window_size);
-            window_pos.0 = (window_pos.0 + window_width).round();
+            window_pos.0 = (window_pos.0 + window_width).ceil();
         }
     }
 }
