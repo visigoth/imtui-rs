@@ -5,10 +5,13 @@ extern crate lazy_static;
 extern crate maplit;
 
 use imtui;
+use std::time::{Duration, SystemTime};
 use imgui;
 use variant_count::VariantCount;
 use std::collections::HashMap;
 use std::vec::Vec;
+use chrono::{DateTime, Utc};
+use std::ops::Add;
 
 mod hn;
 
@@ -39,31 +42,25 @@ enum StoryListMode {
 }
 
 struct WindowData {
+    title: String,
     window_content: WindowContent,
     show_comments: bool,
-    id: hn::ItemId,
-    kids: hn::ItemIds,
-    score: u32,
-    time: u64,
-    text: String,
-    title: String,
-    url: String,
-    domain: String,
+    selected_story_id: Option<HnItemId>,
+    hovered_story_id: Option<HnItemId>,
+    hovered_comment_id: Option<HnItemId>,
+    max_stories: u32,
 }
 
 impl WindowData {
     fn new(window_content: WindowContent) -> WindowData {
         WindowData {
+            title: String::from("[Y] Hacker News"),
             window_content: window_content,
             show_comments: false,
-            id: 0,
-            kids: vec![],
-            score: 0,
-            time: 0,
-            text: String::from(""),
-            title: String::from("[Y] Hacker News"),
-            url: String::from(""),
-            domain: String::from(""),
+            selected_story_id: None,
+            hovered_story_id: None,
+            hovered_comment_id: None,
+            max_stories: 10,
         }
     }
 
@@ -91,8 +88,71 @@ struct DrawContext<'a, 'b> {
     ui: &'a mut imgui::Ui<'b>,
 }
 
+type HnItemId = u32;
+
+struct HnStoryItem {
+    id: HnItemId,
+    by: String,
+    score: i32,
+    time: DateTime<Utc>,
+    text: String,
+    title: String,
+    url: String,
+    domain: String,
+    descendants: u32,
+    children: Vec<HnItemId>,
+}
+
+struct HnCommentItem {
+    id: HnItemId,
+    by: String,
+    score: i32,
+    time: DateTime<Utc>,
+    text: String,
+    children: Vec<HnItemId>,
+    parent: HnItemId,
+}
+
+struct HnJobItem {
+    id: HnItemId,
+    by: String,
+    score: i32,
+    time: DateTime<Utc>,
+    title: String,
+    url: String,
+    domain: String,
+}
+
+struct HnPollItem {
+    id: HnItemId,
+}
+
+struct HnPollOptItem {
+    id: HnItemId,
+}
+
+enum HnItem {
+    Unknown,
+    Story { data: HnStoryItem },
+    Comment { data: HnCommentItem },
+    Job { data: HnJobItem },
+    Poll { data: HnPollItem },
+    PollOpt { data: HnPollOptItem },
+}
+
+struct HnState {
+    items: HashMap<HnItemId, HnItem>,
+    top_ids: Vec<HnItemId>,
+    show_ids: Vec<HnItemId>,
+    ask_ids: Vec<HnItemId>,
+    new_ids: Vec<HnItemId>,
+}
+
 struct AppState {
-    windows: Vec<WindowData>
+    windows: Vec<WindowData>,
+    hn_state: Option<HnState>,
+    last_update_time: SystemTime,
+    next_update: SystemTime,
 }
 
 struct HntermApp {
@@ -108,7 +168,10 @@ impl AppState {
                 WindowData::new(WindowContent::Top),
                 WindowData::new(WindowContent::Top),
                 WindowData::new(WindowContent::Top),
-            ]
+            ],
+            hn_state: None,
+            last_update_time: SystemTime::UNIX_EPOCH,
+            next_update: SystemTime::now(),
         }
     }
 
@@ -118,6 +181,17 @@ impl AppState {
         }
 
         !ui.is_key_pressed('q' as u32)
+    }
+
+    fn update(&mut self) -> bool {
+        let now = SystemTime::now();
+        if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0)  {
+            return false;
+        }
+
+        self.last_update_time = now;
+        self.next_update = now.add(Duration::new(30, 0));
+        true
     }
 }
 
@@ -131,6 +205,16 @@ impl HntermApp {
     }
 
     fn process_frame(&mut self) -> bool {
+        self.state.update();
+
+        for (i, wd) in self.state.windows.iter_mut().enumerate() {
+            wd.title = format!(
+                "[{}] Hacker News ({})",
+                i,
+                CONTENT_TITLE_MAP.get(&wd.window_content).unwrap()
+            );
+        }
+
         self.imtui.set_active();
         self.imtui.new_frame();
 
@@ -139,43 +223,42 @@ impl HntermApp {
             return false;
         }
 
-        let display_size = ui.io().display_size;
-        let windows_to_draw = if display_size[0] < 50.0 {
-            &mut self.state.windows.as_mut_slice()[0..1]
-        } else {
-            self.state.windows.as_mut_slice()
+        let draw_context = DrawContext {
+            imtui: &self.imtui,
+            ui: &mut ui,
         };
 
-        {
-            let display_size = ui.io().display_size;
-            let window_width = display_size[0] / windows_to_draw.len() as f32;
-            let window_size = (window_width, display_size[1]);
-
-            let draw_context = DrawContext {
-                imtui: &self.imtui,
-                ui: &mut ui,
-            };
-
-            let mut window_pos = (0.0, 0.0);
-            let num_windows = windows_to_draw.len();
-            for (i, wd) in windows_to_draw.iter_mut().enumerate() {
-                let mut actual_window_size = window_size;
-                if i != num_windows - 1 {
-                    actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
-                }
-                wd.title = format!(
-                    "[{}] Hacker News ({})",
-                    i,
-                    CONTENT_TITLE_MAP.get(&wd.window_content).unwrap()
-                );
-                wd.render(&draw_context, &window_pos, &actual_window_size);
-                window_pos.0 = (window_pos.0 + window_width).round();
-            }
-        }
-
+        HntermApp::render(&self.state, &draw_context);
         let draw_data = ui.render();
         self.imtui.render(draw_data);
         true
+    }
+
+    fn render(state: &AppState, draw_context: &DrawContext) {
+        if state.windows.len() == 0 {
+            return;
+        }
+
+        let display_size = draw_context.ui.io().display_size;
+        let windows_to_draw = if display_size[0] < 50.0 {
+            &state.windows.as_slice()[0..1]
+        } else {
+            state.windows.as_slice()
+        };
+
+        let window_width = display_size[0] / windows_to_draw.len() as f32;
+        let window_size = (window_width, display_size[1]);
+
+        let mut window_pos = (0.0, 0.0);
+        let num_windows = windows_to_draw.len();
+        for (i, wd) in windows_to_draw.iter().enumerate() {
+            let mut actual_window_size = window_size;
+            if i != num_windows - 1 {
+                actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
+            }
+            wd.render(draw_context, &window_pos, &actual_window_size);
+            window_pos.0 = (window_pos.0 + window_width).round();
+        }
     }
 }
 
