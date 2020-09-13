@@ -248,6 +248,7 @@ impl HntermApp {
     }
 
     fn process_frame(&mut self) -> bool {
+        self.executor.run_until_stalled();
         self.state.update(&self.executor.spawner());
 
         for (i, wd) in self.state.windows.iter_mut().enumerate() {
