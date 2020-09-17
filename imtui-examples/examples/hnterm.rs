@@ -16,9 +16,13 @@ use reqwest;
 use std::error;
 use futures::task::LocalSpawnExt;
 use futures::executor::LocalPool;
-use std::sync::Mutex;
+use futures::Future;
+use futures::task::Context;
+use futures::task::Poll;
+use futures::future::poll_fn;
 use std::cell::Cell;
 use std::rc::Rc;
+use core::pin::Pin;
 
 mod hn;
 
@@ -228,6 +232,10 @@ impl AppState {
         let state_ref = Rc::clone(&self.hn_state);
 
         let fetch_and_assign = async move {
+            match HnState::fetch().await {
+                Ok(state) => state_ref.set(Some(state)),
+                _ => ()
+            }
             state_ref.set(Some(HnState::fetch().await.unwrap()));
         };
         spawner.spawn_local(fetch_and_assign).unwrap();
@@ -248,7 +256,6 @@ impl HntermApp {
     }
 
     fn process_frame(&mut self) -> bool {
-        self.executor.run_until_stalled();
         self.state.update(&self.executor.spawner());
 
         for (i, wd) in self.state.windows.iter_mut().enumerate() {
@@ -335,7 +342,8 @@ fn set_color_scheme(context: &mut imgui::Context, dark: bool) {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn error::Error>> {
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
     let imtui = imtui::Ncurses::init(true, 60.0, -1.0);
@@ -343,5 +351,14 @@ fn main() {
     set_color_scheme(&mut imgui, false);
 
     let mut app = HntermApp::new(imgui, imtui);
-    while app.process_frame() {}
+    let future_fn = |cx: &mut Context| {
+        if app.process_frame() {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    };
+    poll_fn(future_fn).await;
+    Ok(())
 }
