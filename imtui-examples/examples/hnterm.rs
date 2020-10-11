@@ -3,6 +3,8 @@ extern crate variant_count;
 extern crate lazy_static;
 #[macro_use]
 extern crate maplit;
+#[macro_use]
+extern crate debug_here;
 
 use imtui;
 use std::time::{Duration, SystemTime};
@@ -23,6 +25,8 @@ use futures::future::poll_fn;
 use std::cell::Cell;
 use std::rc::Rc;
 use core::pin::Pin;
+use clap::Clap;
+use bugsalot::debugger;
 
 mod hn;
 
@@ -342,8 +346,19 @@ fn set_color_scheme(context: &mut imgui::Context, dark: bool) {
     }
 }
 
+#[derive(Clap)]
+struct Opts {
+    #[clap(short, long, about = "Wait for debugger at startup")]
+    debug: bool
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn error::Error>> {
+    let opts = Opts::parse();
+    if opts.debug {
+        debug_here!();
+    }
+
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
     let imtui = imtui::Ncurses::init(true, 60.0, -1.0);
