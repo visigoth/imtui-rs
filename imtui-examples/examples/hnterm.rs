@@ -26,7 +26,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 use core::pin::Pin;
 use clap::Clap;
-use bugsalot::debugger;
+use eyre::{WrapErr, Result};
+use serde::{Deserialize};
 
 mod hn;
 
@@ -155,30 +156,37 @@ enum HnItem {
     PollOpt { data: HnPollOptItem },
 }
 
+#[derive(Deserialize)]
+struct HnUpdatesResponse {
+    items: Vec<HnItemId>,
+    profiles: Vec<String>,
+}
+
 struct HnState {
     top_ids: Vec<HnItemId>,
     show_ids: Vec<HnItemId>,
     ask_ids: Vec<HnItemId>,
     new_ids: Vec<HnItemId>,
-    changed_ids: Vec<HnItemId>,
+    changed_ids: HnUpdatesResponse,
 }
 
 impl HnState {
 
-    async fn fetch_ids(url: reqwest::Url) -> Result<Vec<HnItemId>, reqwest::Error> {
+    async fn fetch_url<T: for<'de> Deserialize<'de>>(url: reqwest::Url) -> Result<T> {
+        let url_str = String::from(url.as_str());
         reqwest::get(url)
-            .await?
-            .json::<Vec<HnItemId>>()
-            .await
+            .await.wrap_err(format!("Failed to fetch data {}", url_str))?
+            .json::<T>()
+            .await.wrap_err(format!("Failed to parse response {}", url_str))
     }
 
     async fn fetch() -> Result<HnState, Box<dyn error::Error>> {
-        let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0").unwrap();
-        let top_ids = HnState::fetch_ids(base_url.join("topstories.json").unwrap()).await?;
-        let show_ids = HnState::fetch_ids(base_url.join("showstories.json").unwrap()).await?;
-        let ask_ids = HnState::fetch_ids(base_url.join("askstories.json").unwrap()).await?;
-        let new_ids = HnState::fetch_ids(base_url.join("newstories.json").unwrap()).await?;
-        let changed_ids = HnState::fetch_ids(base_url.join("updates.json").unwrap()).await?;
+        let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0/").unwrap();
+        let top_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
+        let show_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
+        let ask_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("askstories.json").unwrap()).await?;
+        let new_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
+        let changed_ids = HnState::fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
 
         let state = HnState {
             top_ids,
@@ -194,15 +202,9 @@ impl HnState {
 struct AppState {
     windows: Vec<WindowData>,
     hn_state: Rc<Cell<Option<HnState>>>,
+    update_in_progress: bool,
     last_update_time: SystemTime,
     next_update: SystemTime,
-}
-
-struct HntermApp {
-    imgui: imgui::Context,
-    imtui: imtui::Ncurses,
-    state: AppState,
-    executor: LocalPool,
 }
 
 impl AppState {
@@ -214,6 +216,7 @@ impl AppState {
                 WindowData::new(WindowContent::Top),
             ],
             hn_state: Rc::new(Cell::new(None)),
+            update_in_progress: false,
             last_update_time: SystemTime::UNIX_EPOCH,
             next_update: SystemTime::now(),
         }
@@ -233,6 +236,8 @@ impl AppState {
             return;
         }
 
+        self.update_in_progress = true;
+
         let state_ref = Rc::clone(&self.hn_state);
 
         let fetch_and_assign = async move {
@@ -249,6 +254,13 @@ impl AppState {
     }
 }
 
+struct HntermApp {
+    imgui: imgui::Context,
+    imtui: imtui::Ncurses,
+    state: AppState,
+    executor: LocalPool,
+}
+
 impl HntermApp {
     fn new(imgui: imgui::Context, imtui: imtui::Ncurses) -> HntermApp {
         HntermApp {
@@ -261,6 +273,7 @@ impl HntermApp {
 
     fn process_frame(&mut self) -> bool {
         self.state.update(&self.executor.spawner());
+        self.executor.run_until_stalled();
 
         for (i, wd) in self.state.windows.iter_mut().enumerate() {
             wd.title = format!(
