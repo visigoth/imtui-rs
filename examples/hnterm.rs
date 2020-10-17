@@ -13,21 +13,21 @@ use variant_count::VariantCount;
 use std::collections::HashMap;
 use std::vec::Vec;
 use chrono::{DateTime, Utc};
+use chrono::naive::NaiveDateTime;
 use std::ops::Add;
 use reqwest;
 use std::error;
 use futures::task::LocalSpawnExt;
 use futures::executor::LocalPool;
-use futures::Future;
 use futures::task::Context;
 use futures::task::Poll;
 use futures::future::poll_fn;
-use std::cell::Cell;
+use std::cell::{RefCell};
 use std::rc::Rc;
-use core::pin::Pin;
 use clap::Clap;
 use eyre::{WrapErr, Result};
 use serde::{Deserialize};
+use serde_json::Value;
 
 mod hn;
 
@@ -60,6 +60,7 @@ enum StoryListMode {
 struct WindowData {
     title: String,
     window_content: WindowContent,
+    hn_state: Rc<RefCell<HnState>>,
     show_comments: bool,
     selected_story_id: Option<HnItemId>,
     hovered_story_id: Option<HnItemId>,
@@ -68,10 +69,11 @@ struct WindowData {
 }
 
 impl WindowData {
-    fn new(window_content: WindowContent) -> WindowData {
+    fn new(window_content: WindowContent, hn_state: &Rc<RefCell<HnState>>) -> WindowData {
         WindowData {
             title: String::from("[Y] Hacker News"),
             window_content: window_content,
+            hn_state: Rc::clone(hn_state),
             show_comments: false,
             selected_story_id: None,
             hovered_story_id: None,
@@ -106,10 +108,13 @@ struct DrawContext<'a, 'b> {
 
 type HnItemId = u32;
 
+#[derive(Deserialize, Clone)]
+#[serde(default)]
 struct HnStoryItem {
     id: HnItemId,
     by: String,
     score: i32,
+    #[serde(with = "chrono::serde::ts_seconds")]
     time: DateTime<Utc>,
     text: String,
     title: String,
@@ -119,6 +124,8 @@ struct HnStoryItem {
     children: Vec<HnItemId>,
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(default)]
 struct HnCommentItem {
     id: HnItemId,
     by: String,
@@ -129,6 +136,8 @@ struct HnCommentItem {
     parent: HnItemId,
 }
 
+#[derive(Deserialize, Clone)]
+#[serde(default)]
 struct HnJobItem {
     id: HnItemId,
     by: String,
@@ -139,21 +148,89 @@ struct HnJobItem {
     domain: String,
 }
 
+#[derive(Deserialize, Clone)]
 struct HnPollItem {
     id: HnItemId,
 }
 
+#[derive(Deserialize, Clone)]
 struct HnPollOptItem {
     id: HnItemId,
 }
 
+#[derive(Clone)]
 enum HnItem {
     Unknown,
-    Story { data: HnStoryItem },
-    Comment { data: HnCommentItem },
-    Job { data: HnJobItem },
-    Poll { data: HnPollItem },
-    PollOpt { data: HnPollOptItem },
+    Story(HnStoryItem),
+    Comment(HnCommentItem),
+    Job(HnJobItem),
+    Poll(HnPollItem),
+    PollOpt(HnPollOptItem),
+}
+
+impl Default for HnStoryItem {
+    fn default() -> Self {
+        HnStoryItem {
+            id: 0,
+            by: String::from(""),
+            score: 0,
+            time: DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
+            text: String::from(""),
+            title: String::from(""),
+            url: String::from(""),
+            domain: String::from(""),
+            descendants: 0,
+            children: vec![],
+        }
+    }
+}
+
+impl Default for HnJobItem {
+    fn default() -> Self {
+        HnJobItem {
+            id: 0,
+            by: String::from(""),
+            score: 0,
+            time: DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
+            title: String::from(""),
+            url: String::from(""),
+            domain: String::from(""),
+        }
+    }
+}
+
+impl Default for HnCommentItem {
+    fn default() -> Self {
+        HnCommentItem {
+            id: 0,
+            by: String::from(""),
+            score: 0,
+            time: DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc),
+            text: String::from(""),
+            children: vec![],
+            parent: 0,
+        }
+    }
+}
+
+impl HnItem {
+    fn from_json_value(value: Value) -> Result<HnItem> {
+        match &value["type"] {
+            Value::String(s) => {
+                match s.as_str() {
+                    "story" => Ok(HnItem::Story(serde_json::from_value::<HnStoryItem>(value)?)),
+                    "job" => Ok(HnItem::Job(serde_json::from_value::<HnJobItem>(value)?)),
+                    "comment" => Ok(HnItem::Comment(serde_json::from_value::<HnCommentItem>(value)?)),
+                    "poll" => Ok(HnItem::Poll(serde_json::from_value::<HnPollItem>(value)?)),
+                    "pollopt" => Ok(HnItem::PollOpt(serde_json::from_value::<HnPollOptItem>(value)?)),
+                    // TODO: this should be an error
+                    _ => Ok(HnItem::Unknown),
+                }
+            },
+            // TODO: this should be an error
+            _ => Ok(HnItem::Unknown)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -162,7 +239,7 @@ struct HnUpdatesResponse {
     profiles: Vec<String>,
 }
 
-struct HnState {
+struct HnRefreshResult {
     top_ids: Vec<HnItemId>,
     show_ids: Vec<HnItemId>,
     ask_ids: Vec<HnItemId>,
@@ -170,7 +247,21 @@ struct HnState {
     changed_ids: HnUpdatesResponse,
 }
 
+struct HnState {
+    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
+    items_to_refresh: RefCell<Vec<HnItemId>>,
+    last_list_refresh: Option<HnRefreshResult>,
+}
+
 impl HnState {
+
+    pub fn new() -> HnState {
+        HnState {
+            items: Rc::new(RefCell::new(HashMap::new())),
+            items_to_refresh: RefCell::new(vec![]),
+            last_list_refresh: None,
+        }
+    }
 
     async fn fetch_url<T: for<'de> Deserialize<'de>>(url: reqwest::Url) -> Result<T> {
         let url_str = String::from(url.as_str());
@@ -180,7 +271,7 @@ impl HnState {
             .await.wrap_err(format!("Failed to parse response {}", url_str))
     }
 
-    async fn fetch() -> Result<HnState, Box<dyn error::Error>> {
+    async fn fetch() -> Result<HnRefreshResult, Box<dyn error::Error>> {
         let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0/").unwrap();
         let top_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
         let show_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
@@ -188,69 +279,137 @@ impl HnState {
         let new_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
         let changed_ids = HnState::fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
 
-        let state = HnState {
+        let result = HnRefreshResult {
             top_ids,
             show_ids,
             ask_ids,
             new_ids,
             changed_ids,
         };
-        Ok(state)
+        Ok(result)
+    }
+
+    async fn fetch_item(item_id: u32) -> Result<HnItem> {
+        HnItem::from_json_value(HnState::fetch_item_json(item_id).await?)
+    }
+
+    async fn fetch_item_json(item_id: u32) -> Result<Value> {
+        let base_url = reqwest::Url::parse(
+            "https://hacker-news.firebaseio.com/v0/item/"
+        ).unwrap();
+        let item_path = format!("{}.json", item_id);
+        let url = base_url.join(&item_path).unwrap();
+        reqwest::get(url)
+            .await.wrap_err(format!("Failed to fetch item {}", item_id))?
+            .json::<Value>()
+            .await.wrap_err(format!("Failed to parse item {}", item_id))
     }
 }
 
 struct AppState {
     windows: Vec<WindowData>,
-    hn_state: Rc<Cell<Option<HnState>>>,
+    hn_state: Rc<RefCell<HnState>>,
     update_in_progress: bool,
     last_update_time: SystemTime,
     next_update: SystemTime,
+    items_refreshing: bool,
 }
 
 impl AppState {
     fn new() -> AppState {
+        let hn_state = Rc::new(RefCell::new(HnState::new()));
         AppState {
             windows: vec![
-                WindowData::new(WindowContent::Top),
-                WindowData::new(WindowContent::Top),
-                WindowData::new(WindowContent::Top),
+                WindowData::new(WindowContent::Top, &hn_state),
+                WindowData::new(WindowContent::Top, &hn_state),
+                WindowData::new(WindowContent::Top, &hn_state),
             ],
-            hn_state: Rc::new(Cell::new(None)),
+            hn_state: hn_state,
             update_in_progress: false,
             last_update_time: SystemTime::UNIX_EPOCH,
             next_update: SystemTime::now(),
+            items_refreshing: false,
         }
     }
 
     fn process_input(&mut self, ui: &imgui::Ui) -> bool {
         if ui.is_key_pressed('+' as u32) && self.windows.len() < 3 {
-            self.windows.push(WindowData::new(WindowContent::Top))
+            self.windows.push(WindowData::new(WindowContent::Top, &self.hn_state))
         }
 
         !ui.is_key_pressed('q' as u32)
     }
 
     fn update(&mut self, spawner: &impl LocalSpawnExt) {
-        let now = SystemTime::now();
-        if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0) {
-            return;
+        // Refresh item information as required
+        if !self.items_refreshing && self.hn_state.borrow().items_to_refresh.borrow().len() != 0
+        {
+            self.items_refreshing = true;
+            let items_to_fetch = self.hn_state.borrow().items_to_refresh.replace(vec![]);
+            let state_ref = Rc::clone(&self.hn_state);
+            let fetch_items = async move {
+                for item_id in items_to_fetch {
+                    let result = HnState::fetch_item(item_id).await;
+
+                    // Do not borrow until after the fetch is complete, so that an overlapping
+                    // borrow does not happen with other work going on.
+                    let hn_state = state_ref.borrow();
+                    let mut items_map = hn_state.items.borrow_mut();
+                    match result {
+                        Ok(item) => {
+                            // Need a copy in order to move the value into the map (without Rc).
+                            let item_clone = item.clone();
+                            match item {
+                                HnItem::Story(story) => { items_map.insert(story.id, item_clone); }
+                                HnItem::Comment(comment) => { items_map.insert(comment.id, item_clone); }
+                                HnItem::Job(job) => { items_map.insert(job.id, item_clone); }
+                                HnItem::Poll(poll) => { items_map.insert(poll.id, item_clone); }
+                                HnItem::PollOpt(pollopt) => { items_map.insert(pollopt.id, item_clone); }
+                                _ => {}
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            };
+            spawner.spawn_local(fetch_items).unwrap();
         }
 
-        self.update_in_progress = true;
-
-        let state_ref = Rc::clone(&self.hn_state);
-
-        let fetch_and_assign = async move {
-            match HnState::fetch().await {
-                Ok(state) => state_ref.set(Some(state)),
-                _ => ()
+        // Update the list of items to be shown every 30 seconds
+        {
+            let now = SystemTime::now();
+            if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0) {
+                return;
             }
-            state_ref.set(Some(HnState::fetch().await.unwrap()));
-        };
-        spawner.spawn_local(fetch_and_assign).unwrap();
 
-        self.last_update_time = now;
-        self.next_update = now.add(Duration::new(30, 0));
+            self.update_in_progress = true;
+
+            let state_ref = Rc::clone(&self.hn_state);
+
+            let fetch_and_assign = async move {
+                match HnState::fetch().await {
+                    Ok(result) => {
+                        let mut state = state_ref.borrow_mut();
+                        // TODO: remove
+                        // For now, add all ids to the items_to_refresh list
+                        {
+                            let mut items_to_refresh = state.items_to_refresh.borrow_mut();
+                            items_to_refresh.extend(result.top_ids.iter());
+                            items_to_refresh.extend(result.show_ids.iter());
+                            items_to_refresh.extend(result.ask_ids.iter());
+                            items_to_refresh.extend(result.new_ids.iter());
+                            items_to_refresh.extend(result.changed_ids.items.iter());
+                        }
+                        state.last_list_refresh = Some(result);
+                    },
+                    _ => ()
+                }
+            };
+            spawner.spawn_local(fetch_and_assign).unwrap();
+
+            self.last_update_time = now;
+            self.next_update = now.add(Duration::new(30, 0));
+        }
     }
 }
 

@@ -11,6 +11,21 @@ readme = "README.md"
 imtui-sys = { version = "0.1.0", path = "imtui-sys" }
 imgui = { version = "0.2.1", path = "imgui-rs" }
 
+[dev-dependencies]
+variant_count = "*"
+lazy_static = "1.4.0"
+maplit = "*"
+chrono = { version = "0.4.19", features = ["serde"] }
+reqwest = { version = "0.10.8", features = ["json"] }
+futures = "0.3.5"
+tokio = { version = "0.2.22", features = ["full"] }
+clap = "3.0.0-beta.2"
+rusty-man = "0.4.0"
+debug-here = "0.2"
+eyre = "0.6.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.59"
+
 [workspace]
 members = [
     "imtui-sys"
