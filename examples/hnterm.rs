@@ -7,7 +7,9 @@ extern crate maplit;
 extern crate debug_here;
 
 use imtui;
-use std::time::{Duration, SystemTime};
+use std::time::Instant;
+use std::fmt;
+use std::time::{Duration};
 use imgui;
 use variant_count::VariantCount;
 use std::collections::HashMap;
@@ -22,7 +24,7 @@ use futures::executor::LocalPool;
 use futures::task::Context;
 use futures::task::Poll;
 use futures::future::poll_fn;
-use std::cell::{RefCell};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use clap::Clap;
 use eyre::{WrapErr, Result};
@@ -248,6 +250,9 @@ struct HnRefreshResult {
 }
 
 struct HnState {
+    last_url: RefCell<Option<reqwest::Url>>,
+    request_bytes: Cell<usize>,
+    request_count: Cell<u32>,
     items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
     items_to_refresh: RefCell<Vec<HnItemId>>,
     last_list_refresh: Option<HnRefreshResult>,
@@ -257,27 +262,37 @@ impl HnState {
 
     pub fn new() -> HnState {
         HnState {
+            last_url: RefCell::new(None),
+            request_bytes: Cell::new(0),
+            request_count: Cell::new(0),
             items: Rc::new(RefCell::new(HashMap::new())),
             items_to_refresh: RefCell::new(vec![]),
             last_list_refresh: None,
         }
     }
 
-    async fn fetch_url<T: for<'de> Deserialize<'de>>(url: reqwest::Url) -> Result<T> {
+    async fn fetch_url<T: for<'de> Deserialize<'de>>(&self, url: reqwest::Url) -> Result<T> {
         let url_str = String::from(url.as_str());
-        reqwest::get(url)
-            .await.wrap_err(format!("Failed to fetch data {}", url_str))?
-            .json::<T>()
-            .await.wrap_err(format!("Failed to parse response {}", url_str))
+        let response = reqwest::get(url.clone())
+            .await.wrap_err(format!("Failed to fetch data {}", url_str))?;
+        let result = response.text().await?;
+
+        self.last_url.replace(Some(url));
+        self.request_bytes.set(self.request_bytes.get() + result.len());
+        self.request_count.set(self.request_count.get() + 1);
+
+        serde_json::from_str::<T>(result.as_str()).wrap_err(
+            format!("Failed to parse response from {}", url_str)
+        )
     }
 
-    async fn fetch() -> Result<HnRefreshResult, Box<dyn error::Error>> {
+    async fn fetch(&self) -> Result<HnRefreshResult, Box<dyn error::Error>> {
         let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0/").unwrap();
-        let top_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
-        let show_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
-        let ask_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("askstories.json").unwrap()).await?;
-        let new_ids = HnState::fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
-        let changed_ids = HnState::fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
+        let top_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
+        let show_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
+        let ask_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("askstories.json").unwrap()).await?;
+        let new_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
+        let changed_ids = self.fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
 
         let result = HnRefreshResult {
             top_ids,
@@ -289,30 +304,74 @@ impl HnState {
         Ok(result)
     }
 
-    async fn fetch_item(item_id: u32) -> Result<HnItem> {
-        HnItem::from_json_value(HnState::fetch_item_json(item_id).await?)
+    async fn fetch_item(&self, item_id: u32) -> Result<HnItem> {
+        HnItem::from_json_value(self.fetch_item_json(item_id).await?)
     }
 
-    async fn fetch_item_json(item_id: u32) -> Result<Value> {
+    async fn fetch_item_json(&self, item_id: u32) -> Result<Value> {
         let base_url = reqwest::Url::parse(
             "https://hacker-news.firebaseio.com/v0/item/"
         ).unwrap();
         let item_path = format!("{}.json", item_id);
         let url = base_url.join(&item_path).unwrap();
-        reqwest::get(url)
-            .await.wrap_err(format!("Failed to fetch item {}", item_id))?
-            .json::<Value>()
-            .await.wrap_err(format!("Failed to parse item {}", item_id))
+        self.fetch_url::<Value>(url).await
+    }
+}
+
+#[derive(Debug)]
+enum StoryListViewMode {
+    Micro,
+    Normal,
+    Spread,
+}
+
+impl fmt::Display for StoryListViewMode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result  {
+        write!(f, "{:?}", self)
+    }
+}
+
+const STATUS_WINDOW_HEIGHT: f32 = 4.0;
+
+struct UpdateStatus {
+    update_in_progress: bool,
+    last_update_time: Option<Instant>,
+    next_update: Instant,
+}
+
+impl UpdateStatus {
+    fn new() -> UpdateStatus {
+        UpdateStatus {
+            update_in_progress: false,
+            last_update_time: None,
+            next_update: Instant::now()
+        }
+    }
+
+    fn update_needed(&self) -> bool {
+        if self.update_in_progress {
+            return false;
+        }
+
+        match self.last_update_time {
+            Some(then) => Instant::now().duration_since(then) >= Duration::new(30, 0),
+            None => true
+        }
+    }
+
+    fn set_last_update(&mut self, t: Instant) {
+        self.last_update_time = Some(t);
+        self.next_update = t.add(Duration::new(30, 0));
     }
 }
 
 struct AppState {
     windows: Vec<WindowData>,
     hn_state: Rc<RefCell<HnState>>,
-    update_in_progress: bool,
-    last_update_time: SystemTime,
-    next_update: SystemTime,
+    list_update_status: Rc<RefCell<UpdateStatus>>,
     items_refreshing: bool,
+    show_status_window: bool,
+    view_mode: StoryListViewMode,
 }
 
 impl AppState {
@@ -325,10 +384,10 @@ impl AppState {
                 WindowData::new(WindowContent::Top, &hn_state),
             ],
             hn_state: hn_state,
-            update_in_progress: false,
-            last_update_time: SystemTime::UNIX_EPOCH,
-            next_update: SystemTime::now(),
+            list_update_status: Rc::new(RefCell::new(UpdateStatus::new())),
             items_refreshing: false,
+            show_status_window: true,
+            view_mode: StoryListViewMode::Normal,
         }
     }
 
@@ -349,11 +408,8 @@ impl AppState {
             let state_ref = Rc::clone(&self.hn_state);
             let fetch_items = async move {
                 for item_id in items_to_fetch {
-                    let result = HnState::fetch_item(item_id).await;
-
-                    // Do not borrow until after the fetch is complete, so that an overlapping
-                    // borrow does not happen with other work going on.
                     let hn_state = state_ref.borrow();
+                    let result = hn_state.fetch_item(item_id).await;
                     let mut items_map = hn_state.items.borrow_mut();
                     match result {
                         Ok(item) => {
@@ -376,18 +432,20 @@ impl AppState {
         }
 
         // Update the list of items to be shown every 30 seconds
-        {
-            let now = SystemTime::now();
-            if now.duration_since(self.last_update_time).unwrap() < Duration::new(30, 0) {
-                return;
+        if self.list_update_status.borrow().update_needed() {
+            {
+                let mut update_status = self.list_update_status.borrow_mut();
+                update_status.update_in_progress = true;
             }
 
-            self.update_in_progress = true;
-
             let state_ref = Rc::clone(&self.hn_state);
+            let update_status_ref = Rc::clone(&self.list_update_status);
 
             let fetch_and_assign = async move {
-                match HnState::fetch().await {
+                let result = {
+                    state_ref.borrow().fetch().await
+                };
+                match result {
                     Ok(result) => {
                         let mut state = state_ref.borrow_mut();
                         // TODO: remove
@@ -404,11 +462,10 @@ impl AppState {
                     },
                     _ => ()
                 }
+
+                update_status_ref.borrow_mut().set_last_update(Instant::now());
             };
             spawner.spawn_local(fetch_and_assign).unwrap();
-
-            self.last_update_time = now;
-            self.next_update = now.add(Duration::new(30, 0));
         }
     }
 }
@@ -467,24 +524,71 @@ impl HntermApp {
         }
 
         let display_size = draw_context.ui.io().display_size;
-        let windows_to_draw = if display_size[0] < 50.0 {
-            &state.windows.as_slice()[0..1]
-        } else {
-            state.windows.as_slice()
-        };
+        {
+            let windows_to_draw = if display_size[0] < 50.0 {
+                &state.windows.as_slice()[0..1]
+            } else {
+                state.windows.as_slice()
+            };
 
-        let window_width = display_size[0] / windows_to_draw.len() as f32;
-        let window_size = (window_width, display_size[1]);
-
-        let mut window_pos = (0.0, 0.0);
-        let num_windows = windows_to_draw.len();
-        for (i, wd) in windows_to_draw.iter().enumerate() {
-            let mut actual_window_size = window_size;
-            if i != num_windows - 1 {
-                actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
+            let window_width = display_size[0] / windows_to_draw.len() as f32;
+            let mut window_height = display_size[1];
+            if state.show_status_window {
+                window_height -= STATUS_WINDOW_HEIGHT;
             }
-            wd.render(draw_context, &window_pos, &actual_window_size);
-            window_pos.0 = (window_pos.0 + window_width).ceil();
+
+            let window_size = (window_width, window_height);
+
+            let mut window_pos = (0.0, 0.0);
+            let num_windows = windows_to_draw.len();
+            for (i, wd) in windows_to_draw.iter().enumerate() {
+                let mut actual_window_size = window_size;
+                if i != num_windows - 1 {
+                    actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
+                }
+                wd.render(draw_context, &window_pos, &actual_window_size);
+                window_pos.0 = (window_pos.0 + window_width).ceil();
+            }
+        }
+
+        // Draw the status window
+        if state.show_status_window {
+            let title = imgui::ImString::new(
+                format!("Status | Story List Mode: {}", state.view_mode.to_string())
+            );
+            let window = imgui::Window::new(&title)
+                .position([0., display_size[1] - STATUS_WINDOW_HEIGHT], imgui::Condition::Always)
+                .size([display_size[0], STATUS_WINDOW_HEIGHT], imgui::Condition::Always)
+                .flags(imgui::WindowFlags::NO_COLLAPSE |
+                       imgui::WindowFlags::NO_RESIZE |
+                       imgui::WindowFlags::NO_MOVE |
+                       imgui::WindowFlags::NO_SCROLLBAR);
+            if let Some(window_token) = window.begin(draw_context.ui) {
+                let now = Instant::now();
+                let time_left = if now >= state.list_update_status.borrow().next_update {
+                    Duration::new(0,0)
+                } else {
+                    state.list_update_status.borrow().next_update.duration_since(now)
+                };
+                let hn_state = state.hn_state.borrow();
+                let opt = hn_state.last_url.borrow();
+                let last_url = match opt.as_ref() {
+                    Some(r) => String::from(r.as_str()),
+                    None => String::from("[None]")
+                };
+
+                draw_context.ui.text(
+                    format!(" API requests     : {} / {} B (next update in {} s)",
+                            hn_state.request_count.get(),
+                            hn_state.request_bytes.get(),
+                            time_left.as_secs()
+                    )
+                );
+                draw_context.ui.text(
+                    format!(" Last API request: {}", last_url)
+                );
+                window_token.end(draw_context.ui);
+            }
         }
     }
 }
