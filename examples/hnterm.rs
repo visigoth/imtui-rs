@@ -7,6 +7,12 @@ extern crate maplit;
 extern crate debug_here;
 
 use imtui;
+use std::task::Waker;
+use std::task::Poll;
+use std::pin::Pin;
+use std::future::Future;
+use std::collections::VecDeque;
+use tokio::task::JoinHandle;
 use std::time::Instant;
 use std::fmt;
 use std::time::{Duration};
@@ -22,7 +28,6 @@ use std::error;
 use futures::task::LocalSpawnExt;
 use futures::executor::LocalPool;
 use futures::task::Context;
-use futures::task::Poll;
 use futures::future::poll_fn;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -249,25 +254,18 @@ struct HnRefreshResult {
     changed_ids: HnUpdatesResponse,
 }
 
-struct HnState {
+struct HnApiClient {
     last_url: RefCell<Option<reqwest::Url>>,
     request_bytes: Cell<usize>,
     request_count: Cell<u32>,
-    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
-    items_to_refresh: RefCell<Vec<HnItemId>>,
-    last_list_refresh: Option<HnRefreshResult>,
 }
 
-impl HnState {
-
-    pub fn new() -> HnState {
-        HnState {
+impl HnApiClient {
+    fn new() -> HnApiClient {
+        HnApiClient {
             last_url: RefCell::new(None),
             request_bytes: Cell::new(0),
             request_count: Cell::new(0),
-            items: Rc::new(RefCell::new(HashMap::new())),
-            items_to_refresh: RefCell::new(vec![]),
-            last_list_refresh: None,
         }
     }
 
@@ -286,24 +284,6 @@ impl HnState {
         )
     }
 
-    async fn fetch(&self) -> Result<HnRefreshResult, Box<dyn error::Error>> {
-        let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0/").unwrap();
-        let top_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
-        let show_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
-        let ask_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("askstories.json").unwrap()).await?;
-        let new_ids = self.fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
-        let changed_ids = self.fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
-
-        let result = HnRefreshResult {
-            top_ids,
-            show_ids,
-            ask_ids,
-            new_ids,
-            changed_ids,
-        };
-        Ok(result)
-    }
-
     async fn fetch_item(&self, item_id: u32) -> Result<HnItem> {
         HnItem::from_json_value(self.fetch_item_json(item_id).await?)
     }
@@ -315,6 +295,126 @@ impl HnState {
         let item_path = format!("{}.json", item_id);
         let url = base_url.join(&item_path).unwrap();
         self.fetch_url::<Value>(url).await
+    }
+}
+
+struct HnItemFetchFuture {
+    hn_api: Rc<RefCell<HnApiClient>>,
+    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
+    items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
+    current_item: Option<Pin<Box<dyn Future<Output=Result<HnItem>>>>>,
+    waker: Option<Waker>,
+}
+
+impl HnItemFetchFuture {
+    fn start(hn_api: &Rc<RefCell<HnApiClient>>, items: &Rc<RefCell<HashMap<HnItemId, HnItem>>>, items_to_fetch: &Rc<RefCell<VecDeque<HnItemId>>>) -> JoinHandle<()> {
+        let future = HnItemFetchFuture {
+            hn_api: hn_api.clone(),
+            items: items.clone(),
+            items_to_fetch: items_to_fetch.clone(),
+            current_item: None,
+            waker: None,
+        };
+        tokio::task::spawn_local(future)
+    }
+
+    fn wake(&self) {
+        match &self.waker {
+            Some(waker) => waker.wake_by_ref(),
+            None => ()
+        }
+    }
+}
+
+impl Future for HnItemFetchFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.get_mut();
+        let next_item = {
+            state.waker = Some(cx.waker().clone());
+
+            if let Some(current_item) = &mut state.current_item {
+                match current_item.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => {
+                        match result {
+                            Ok(item) => {
+                                // Need a copy in order to move the value into the map (without Rc).
+                                let item_clone = item.clone();
+                                let mut items = state.items.borrow_mut();
+                                match item {
+                                    HnItem::Story(story) => { items.insert(story.id, item_clone); }
+                                    HnItem::Comment(comment) => { items.insert(comment.id, item_clone); }
+                                    HnItem::Job(job) => { items.insert(job.id, item_clone); }
+                                    HnItem::Poll(poll) => { items.insert(poll.id, item_clone); }
+                                    HnItem::PollOpt(pollopt) => { items.insert(pollopt.id, item_clone); }
+                                    _ => {}
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+
+            state.items_to_fetch.borrow_mut().pop_front()
+        };
+
+        match next_item {
+            Some(item_id) => {
+                let api_rc = state.hn_api.clone();
+                state.current_item = Some(Box::pin(
+                    async move {
+                        api_rc.borrow().fetch_item(item_id).await
+                    }
+                ));
+                Poll::Pending
+            },
+            None => Poll::Ready(())
+        }
+    }
+}
+
+struct HnState {
+    hn_api: Rc<RefCell<HnApiClient>>,
+    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
+    items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
+    last_list_refresh: Option<HnRefreshResult>,
+    item_fetch_task: JoinHandle<()>,
+}
+
+impl HnState {
+    pub fn new() -> HnState {
+        let items = Rc::new(RefCell::new(HashMap::new()));
+        let api = Rc::new(RefCell::new(HnApiClient::new()));
+        let items_to_fetch = Rc::new(RefCell::new(VecDeque::new()));
+        HnState {
+            hn_api: api.clone(),
+            items: items.clone(),
+            items_to_fetch: items_to_fetch.clone(),
+            last_list_refresh: None,
+            item_fetch_task: HnItemFetchFuture::start(&api, &items, &items_to_fetch)
+        }
+    }
+
+    async fn fetch(&self) -> Result<HnRefreshResult, Box<dyn error::Error>> {
+        let base_url = reqwest::Url::parse("https://hacker-news.firebaseio.com/v0/").unwrap();
+        let api = self.hn_api.borrow();
+        let top_ids = api.fetch_url::<Vec<HnItemId>>(base_url.join("topstories.json").unwrap()).await?;
+        let show_ids = api.fetch_url::<Vec<HnItemId>>(base_url.join("showstories.json").unwrap()).await?;
+        let ask_ids = api.fetch_url::<Vec<HnItemId>>(base_url.join("askstories.json").unwrap()).await?;
+        let new_ids = api.fetch_url::<Vec<HnItemId>>(base_url.join("newstories.json").unwrap()).await?;
+        let changed_ids = api.fetch_url::<HnUpdatesResponse>(base_url.join("updates.json").unwrap()).await?;
+
+        let result = HnRefreshResult {
+            top_ids,
+            show_ids,
+            ask_ids,
+            new_ids,
+            changed_ids,
+        };
+        Ok(result)
     }
 }
 
@@ -369,7 +469,6 @@ struct AppState {
     windows: Vec<WindowData>,
     hn_state: Rc<RefCell<HnState>>,
     list_update_status: Rc<RefCell<UpdateStatus>>,
-    items_refreshing: bool,
     show_status_window: bool,
     view_mode: StoryListViewMode,
 }
@@ -385,7 +484,6 @@ impl AppState {
             ],
             hn_state: hn_state,
             list_update_status: Rc::new(RefCell::new(UpdateStatus::new())),
-            items_refreshing: false,
             show_status_window: true,
             view_mode: StoryListViewMode::Normal,
         }
@@ -399,38 +497,7 @@ impl AppState {
         !ui.is_key_pressed('q' as u32)
     }
 
-    fn update(&mut self, spawner: &impl LocalSpawnExt) {
-        // Refresh item information as required
-        if !self.items_refreshing && self.hn_state.borrow().items_to_refresh.borrow().len() != 0
-        {
-            self.items_refreshing = true;
-            let items_to_fetch = self.hn_state.borrow().items_to_refresh.replace(vec![]);
-            let state_ref = Rc::clone(&self.hn_state);
-            let fetch_items = async move {
-                for item_id in items_to_fetch {
-                    let hn_state = state_ref.borrow();
-                    let result = hn_state.fetch_item(item_id).await;
-                    let mut items_map = hn_state.items.borrow_mut();
-                    match result {
-                        Ok(item) => {
-                            // Need a copy in order to move the value into the map (without Rc).
-                            let item_clone = item.clone();
-                            match item {
-                                HnItem::Story(story) => { items_map.insert(story.id, item_clone); }
-                                HnItem::Comment(comment) => { items_map.insert(comment.id, item_clone); }
-                                HnItem::Job(job) => { items_map.insert(job.id, item_clone); }
-                                HnItem::Poll(poll) => { items_map.insert(poll.id, item_clone); }
-                                HnItem::PollOpt(pollopt) => { items_map.insert(pollopt.id, item_clone); }
-                                _ => {}
-                            }
-                        },
-                        _ => {}
-                    }
-                }
-            };
-            spawner.spawn_local(fetch_items).unwrap();
-        }
-
+    fn update(&mut self) {
         // Update the list of items to be shown every 30 seconds
         if self.list_update_status.borrow().update_needed() {
             {
@@ -451,12 +518,12 @@ impl AppState {
                         // TODO: remove
                         // For now, add all ids to the items_to_refresh list
                         {
-                            let mut items_to_refresh = state.items_to_refresh.borrow_mut();
-                            items_to_refresh.extend(result.top_ids.iter());
-                            items_to_refresh.extend(result.show_ids.iter());
-                            items_to_refresh.extend(result.ask_ids.iter());
-                            items_to_refresh.extend(result.new_ids.iter());
-                            items_to_refresh.extend(result.changed_ids.items.iter());
+                            let mut items_to_fetch = state.items_to_fetch.borrow_mut();
+                            items_to_fetch.extend(result.top_ids.iter());
+                            items_to_fetch.extend(result.show_ids.iter());
+                            items_to_fetch.extend(result.ask_ids.iter());
+                            items_to_fetch.extend(result.new_ids.iter());
+                            items_to_fetch.extend(result.changed_ids.items.iter());
                         }
                         state.last_list_refresh = Some(result);
                     },
@@ -465,7 +532,7 @@ impl AppState {
 
                 update_status_ref.borrow_mut().set_last_update(Instant::now());
             };
-            spawner.spawn_local(fetch_and_assign).unwrap();
+            tokio::task::spawn_local(fetch_and_assign);
         }
     }
 }
@@ -474,7 +541,6 @@ struct HntermApp {
     imgui: imgui::Context,
     imtui: imtui::Ncurses,
     state: AppState,
-    executor: LocalPool,
 }
 
 impl HntermApp {
@@ -482,14 +548,12 @@ impl HntermApp {
         HntermApp {
             imgui,
             imtui,
-            executor: LocalPool::new(),
             state: AppState::new(),
         }
     }
 
     fn process_frame(&mut self) -> bool {
-        self.state.update(&self.executor.spawner());
-        self.executor.run_until_stalled();
+        self.state.update();
 
         for (i, wd) in self.state.windows.iter_mut().enumerate() {
             wd.title = format!(
@@ -571,7 +635,8 @@ impl HntermApp {
                     state.list_update_status.borrow().next_update.duration_since(now)
                 };
                 let hn_state = state.hn_state.borrow();
-                let opt = hn_state.last_url.borrow();
+                let api = hn_state.hn_api.borrow();
+                let opt = api.last_url.borrow();
                 let last_url = match opt.as_ref() {
                     Some(r) => String::from(r.as_str()),
                     None => String::from("[None]")
@@ -579,10 +644,13 @@ impl HntermApp {
 
                 draw_context.ui.text(
                     format!(" API requests     : {} / {} B (next update in {} s)",
-                            hn_state.request_count.get(),
-                            hn_state.request_bytes.get(),
+                            api.request_count.get(),
+                            api.request_bytes.get(),
                             time_left.as_secs()
                     )
+                );
+                draw_context.ui.text(
+                    format!(" Item queue length    : {}", hn_state.items_to_fetch.borrow().len())
                 );
                 draw_context.ui.text(
                     format!(" Last API request: {}", last_url)
@@ -641,15 +709,22 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
     set_color_scheme(&mut imgui, false);
 
-    let mut app = HntermApp::new(imgui, imtui);
-    let future_fn = |cx: &mut Context| {
-        if app.process_frame() {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        } else {
-            Poll::Ready(())
-        }
-    };
-    poll_fn(future_fn).await;
+    let local_set = tokio::task::LocalSet::new();
+
+    local_set.run_until(async move {
+        let mut app = HntermApp::new(imgui, imtui);
+
+        let future_fn = |cx: &mut Context| {
+            if app.process_frame() {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        };
+
+        let future = poll_fn(future_fn);
+        future.await
+    }).await;
     Ok(())
 }
