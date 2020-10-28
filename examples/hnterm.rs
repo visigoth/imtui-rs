@@ -303,23 +303,25 @@ struct HnItemFetchFuture {
     items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
     items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
     current_item: Option<Pin<Box<dyn Future<Output=Result<HnItem>>>>>,
-    waker: Option<Waker>,
+    waker: Rc<RefCell<Option<Waker>>>,
 }
 
 impl HnItemFetchFuture {
-    fn start(hn_api: &Rc<RefCell<HnApiClient>>, items: &Rc<RefCell<HashMap<HnItemId, HnItem>>>, items_to_fetch: &Rc<RefCell<VecDeque<HnItemId>>>) -> JoinHandle<()> {
+    fn start(hn_api: &Rc<RefCell<HnApiClient>>, items: &Rc<RefCell<HashMap<HnItemId, HnItem>>>, items_to_fetch: &Rc<RefCell<VecDeque<HnItemId>>>) -> (Rc<RefCell<Option<Waker>>>, JoinHandle<()>) {
+        let waker = Rc::new(RefCell::new(None));
         let future = HnItemFetchFuture {
             hn_api: hn_api.clone(),
             items: items.clone(),
             items_to_fetch: items_to_fetch.clone(),
             current_item: None,
-            waker: None,
+            waker: waker.clone(),
         };
-        tokio::task::spawn_local(future)
+        return (waker, tokio::task::spawn_local(future))
     }
 
     fn wake(&self) {
-        match &self.waker {
+        let w = self.waker.borrow();
+        match &*w {
             Some(waker) => waker.wake_by_ref(),
             None => ()
         }
@@ -332,7 +334,7 @@ impl Future for HnItemFetchFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut state = self.get_mut();
         let next_item = {
-            state.waker = Some(cx.waker().clone());
+            state.waker.replace(Some(cx.waker().clone()));
 
             if let Some(current_item) = &mut state.current_item {
                 match current_item.as_mut().poll(cx) {
@@ -369,10 +371,13 @@ impl Future for HnItemFetchFuture {
                         api_rc.borrow().fetch_item(item_id).await
                     }
                 ));
-                Poll::Pending
+                cx.waker().wake_by_ref();
             },
-            None => Poll::Ready(())
-        }
+            None => ()
+        };
+
+        // Always return pending
+        Poll::Pending
     }
 }
 
@@ -381,7 +386,7 @@ struct HnState {
     items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
     items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
     last_list_refresh: Option<HnRefreshResult>,
-    item_fetch_task: JoinHandle<()>,
+    item_fetch_task: (Rc<RefCell<Option<Waker>>>, JoinHandle<()>)
 }
 
 impl HnState {
@@ -415,6 +420,14 @@ impl HnState {
             changed_ids,
         };
         Ok(result)
+    }
+
+    fn queue_items<'a>(&mut self, items: impl IntoIterator<Item = &'a HnItemId>) {
+        self.items_to_fetch.borrow_mut().extend(items);
+        match &*self.item_fetch_task.0.borrow() {
+            Some(waker) => waker.wake_by_ref(),
+            None => ()
+        }
     }
 }
 
@@ -518,12 +531,11 @@ impl AppState {
                         // TODO: remove
                         // For now, add all ids to the items_to_refresh list
                         {
-                            let mut items_to_fetch = state.items_to_fetch.borrow_mut();
-                            items_to_fetch.extend(result.top_ids.iter());
-                            items_to_fetch.extend(result.show_ids.iter());
-                            items_to_fetch.extend(result.ask_ids.iter());
-                            items_to_fetch.extend(result.new_ids.iter());
-                            items_to_fetch.extend(result.changed_ids.items.iter());
+                            state.queue_items(&result.top_ids);
+                            state.queue_items(&result.show_ids);
+                            state.queue_items(&result.ask_ids);
+                            state.queue_items(&result.new_ids);
+                            state.queue_items(&result.changed_ids.items);
                         }
                         state.last_list_refresh = Some(result);
                     },
@@ -643,17 +655,17 @@ impl HntermApp {
                 };
 
                 draw_context.ui.text(
-                    format!(" API requests     : {} / {} B (next update in {} s)",
+                    format!(" API requests      : {} / {} B (next update in {} s)",
                             api.request_count.get(),
                             api.request_bytes.get(),
                             time_left.as_secs()
                     )
                 );
                 draw_context.ui.text(
-                    format!(" Item queue length    : {}", hn_state.items_to_fetch.borrow().len())
+                    format!(" Item queue length : {}", hn_state.items_to_fetch.borrow().len())
                 );
                 draw_context.ui.text(
-                    format!(" Last API request: {}", last_url)
+                    format!(" Last API request  : {}", last_url)
                 );
                 window_token.end(draw_context.ui);
             }
