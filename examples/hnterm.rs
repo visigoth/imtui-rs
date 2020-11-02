@@ -386,6 +386,7 @@ impl Stream for ItemFetchQueue {
 
 struct HnState {
     hn_api: Rc<RefCell<HnApiClient>>,
+    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
     items_to_fetch: ItemFetchQueue,
     item_fetch_task: JoinHandle<()>,
     last_list_refresh: Option<HnRefreshResult>,
@@ -398,7 +399,8 @@ impl HnState {
         let fetch_queue = ItemFetchQueue::new();
         let join_handle = fetch_queue.start(api.clone(), items.clone());
         HnState {
-            hn_api: api.clone(),
+            hn_api: api,
+            items: items,
             items_to_fetch: fetch_queue,
             item_fetch_task: join_handle,
             last_list_refresh: None,
@@ -523,15 +525,14 @@ impl AppState {
                 match result {
                     Ok(result) => {
                         let mut state = state_ref.borrow_mut();
-                        // TODO: remove
-                        // For now, add all ids to the items_to_refresh list
-                        {
-                            state.items_to_fetch.queue_items(&result.top_ids);
-                            state.items_to_fetch.queue_items(&result.show_ids);
-                            state.items_to_fetch.queue_items(&result.ask_ids);
-                            state.items_to_fetch.queue_items(&result.new_ids);
-                            state.items_to_fetch.queue_items(&result.changed_ids.items);
-                        }
+
+                        // Update the items in the changed list that have
+                        // already been downloaded
+                        let items = state.items.clone();
+                        result.changed_ids.items.clone()
+                            .into_iter()
+                            .filter(move |id| items.borrow().contains_key(id))
+                            .for_each(|id| state.items_to_fetch.queue_item(id));
                         state.last_list_refresh = Some(result);
                     },
                     _ => ()
