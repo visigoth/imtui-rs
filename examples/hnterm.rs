@@ -386,7 +386,6 @@ impl Stream for ItemFetchQueue {
 
 struct HnState {
     hn_api: Rc<RefCell<HnApiClient>>,
-    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
     items_to_fetch: ItemFetchQueue,
     item_fetch_task: JoinHandle<()>,
     last_list_refresh: Option<HnRefreshResult>,
@@ -400,7 +399,6 @@ impl HnState {
         let join_handle = fetch_queue.start(api.clone(), items.clone());
         HnState {
             hn_api: api.clone(),
-            items: items.clone(),
             items_to_fetch: fetch_queue,
             item_fetch_task: join_handle,
             last_list_refresh: None,
@@ -471,6 +469,7 @@ impl UpdateStatus {
     fn set_last_update(&mut self, t: Instant) {
         self.last_update_time = Some(t);
         self.next_update = t.add(Duration::new(30, 0));
+        self.update_in_progress = false;
     }
 }
 
