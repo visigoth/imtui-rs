@@ -7,6 +7,8 @@ extern crate maplit;
 extern crate debug_here;
 
 use imtui;
+use futures::future;
+use futures::stream::{self, Stream, StreamExt};
 use std::task::Waker;
 use std::task::Poll;
 use std::pin::Pin;
@@ -298,108 +300,110 @@ impl HnApiClient {
     }
 }
 
-struct HnItemFetchFuture {
-    hn_api: Rc<RefCell<HnApiClient>>,
-    items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
-    items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
-    current_item: Option<Pin<Box<dyn Future<Output=Result<HnItem>>>>>,
-    waker: Rc<RefCell<Option<Waker>>>,
-}
+struct ItemFetchQueue(Rc<RefCell<VecDeque<HnItemId>>>, Rc<RefCell<Option<Waker>>>);
 
-impl HnItemFetchFuture {
-    fn start(hn_api: &Rc<RefCell<HnApiClient>>, items: &Rc<RefCell<HashMap<HnItemId, HnItem>>>, items_to_fetch: &Rc<RefCell<VecDeque<HnItemId>>>) -> (Rc<RefCell<Option<Waker>>>, JoinHandle<()>) {
-        let waker = Rc::new(RefCell::new(None));
-        let future = HnItemFetchFuture {
-            hn_api: hn_api.clone(),
-            items: items.clone(),
-            items_to_fetch: items_to_fetch.clone(),
-            current_item: None,
-            waker: waker.clone(),
-        };
-        return (waker, tokio::task::spawn_local(future))
+impl ItemFetchQueue {
+    fn new() -> ItemFetchQueue {
+        ItemFetchQueue(Rc::new(RefCell::new(VecDeque::new())), Rc::new(RefCell::new(None)))
+    }
+
+    fn queue_item(&self, item_id: HnItemId) {
+        self.0.borrow_mut().push_back(item_id);
+        self.wake()
+    }
+
+    fn queue_items<'a>(&mut self, items: impl IntoIterator<Item = &'a HnItemId>) {
+        self.0.borrow_mut().extend(items);
+        self.wake()
+    }
+
+    fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 
     fn wake(&self) {
-        let w = self.waker.borrow();
+        let w = self.1.borrow();
         match &*w {
             Some(waker) => waker.wake_by_ref(),
             None => ()
         }
     }
-}
 
-impl Future for HnItemFetchFuture {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.get_mut();
-        let next_item = {
-            state.waker.replace(Some(cx.waker().clone()));
-
-            if let Some(current_item) = &mut state.current_item {
-                match current_item.as_mut().poll(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(result) => {
-                        match result {
-                            Ok(item) => {
-                                // Need a copy in order to move the value into the map (without Rc).
-                                let item_clone = item.clone();
-                                let mut items = state.items.borrow_mut();
-                                match item {
-                                    HnItem::Story(story) => { items.insert(story.id, item_clone); }
-                                    HnItem::Comment(comment) => { items.insert(comment.id, item_clone); }
-                                    HnItem::Job(job) => { items.insert(job.id, item_clone); }
-                                    HnItem::Poll(poll) => { items.insert(poll.id, item_clone); }
-                                    HnItem::PollOpt(pollopt) => { items.insert(pollopt.id, item_clone); }
-                                    _ => {}
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
+    fn start(&self, hn_api: Rc<RefCell<HnApiClient>>, items: Rc<RefCell<HashMap<HnItemId, HnItem>>>) -> JoinHandle<()> {
+        let item_ids_rc = self.0.clone();
+        let waker_rc = self.1.clone();
+        let fut = stream::poll_fn(move |cx| {
+            match item_ids_rc.borrow_mut().pop_front() {
+                Some(id) => Poll::Ready(Some(id)),
+                None => {
+                    waker_rc.borrow_mut().replace(cx.waker().clone());
+                    Poll::Pending
                 }
             }
+        }).map(move |id| {
+            let c = hn_api.clone();
+            async move {
+                c.borrow().fetch_item(id).await
+            }
+        }).buffer_unordered(10)
+            .for_each(move |result| {
+                match result {
+                    Ok(item) => {
+                        // Need a copy in order to move the value into the map (without Rc).
+                        let item_clone = item.clone();
+                        let mut item_map = items.borrow_mut();
+                        match item {
+                            HnItem::Story(story) => { item_map.insert(story.id, item_clone); }
+                            HnItem::Comment(comment) => { item_map.insert(comment.id, item_clone); }
+                            HnItem::Job(job) => { item_map.insert(job.id, item_clone); }
+                            HnItem::Poll(poll) => { item_map.insert(poll.id, item_clone); }
+                            HnItem::PollOpt(pollopt) => { item_map.insert(pollopt.id, item_clone); }
+                            _ => {}
+                        }
+                    },
+                    _ => {}
+                };
+                future::ready(())
+            });
+        tokio::task::spawn_local(fut)
+    }
+}
 
-            state.items_to_fetch.borrow_mut().pop_front()
-        };
+impl Stream for ItemFetchQueue {
+    type Item = HnItemId;
 
-        match next_item {
-            Some(item_id) => {
-                let api_rc = state.hn_api.clone();
-                state.current_item = Some(Box::pin(
-                    async move {
-                        api_rc.borrow().fetch_item(item_id).await
-                    }
-                ));
-                cx.waker().wake_by_ref();
-            },
-            None => ()
-        };
-
-        // Always return pending
-        Poll::Pending
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let state = self.get_mut();
+        match state.0.borrow_mut().pop_front() {
+            Some(id) => Poll::Ready(Some(id)),
+            None => {
+                state.1.borrow_mut().replace(cx.waker().clone());
+                Poll::Pending
+            }
+        }
     }
 }
 
 struct HnState {
     hn_api: Rc<RefCell<HnApiClient>>,
     items: Rc<RefCell<HashMap<HnItemId, HnItem>>>,
-    items_to_fetch: Rc<RefCell<VecDeque<HnItemId>>>,
+    items_to_fetch: ItemFetchQueue,
+    item_fetch_task: JoinHandle<()>,
     last_list_refresh: Option<HnRefreshResult>,
-    item_fetch_task: (Rc<RefCell<Option<Waker>>>, JoinHandle<()>)
 }
 
 impl HnState {
     pub fn new() -> HnState {
         let items = Rc::new(RefCell::new(HashMap::new()));
         let api = Rc::new(RefCell::new(HnApiClient::new()));
-        let items_to_fetch = Rc::new(RefCell::new(VecDeque::new()));
+        let fetch_queue = ItemFetchQueue::new();
+        let join_handle = fetch_queue.start(api.clone(), items.clone());
         HnState {
             hn_api: api.clone(),
             items: items.clone(),
-            items_to_fetch: items_to_fetch.clone(),
+            items_to_fetch: fetch_queue,
+            item_fetch_task: join_handle,
             last_list_refresh: None,
-            item_fetch_task: HnItemFetchFuture::start(&api, &items, &items_to_fetch)
         }
     }
 
@@ -420,14 +424,6 @@ impl HnState {
             changed_ids,
         };
         Ok(result)
-    }
-
-    fn queue_items<'a>(&mut self, items: impl IntoIterator<Item = &'a HnItemId>) {
-        self.items_to_fetch.borrow_mut().extend(items);
-        match &*self.item_fetch_task.0.borrow() {
-            Some(waker) => waker.wake_by_ref(),
-            None => ()
-        }
     }
 }
 
@@ -531,11 +527,11 @@ impl AppState {
                         // TODO: remove
                         // For now, add all ids to the items_to_refresh list
                         {
-                            state.queue_items(&result.top_ids);
-                            state.queue_items(&result.show_ids);
-                            state.queue_items(&result.ask_ids);
-                            state.queue_items(&result.new_ids);
-                            state.queue_items(&result.changed_ids.items);
+                            state.items_to_fetch.queue_items(&result.top_ids);
+                            state.items_to_fetch.queue_items(&result.show_ids);
+                            state.items_to_fetch.queue_items(&result.ask_ids);
+                            state.items_to_fetch.queue_items(&result.new_ids);
+                            state.items_to_fetch.queue_items(&result.changed_ids.items);
                         }
                         state.last_list_refresh = Some(result);
                     },
@@ -662,7 +658,7 @@ impl HntermApp {
                     )
                 );
                 draw_context.ui.text(
-                    format!(" Item queue length : {}", hn_state.items_to_fetch.borrow().len())
+                    format!(" Item queue length : {}", hn_state.items_to_fetch.len())
                 );
                 draw_context.ui.text(
                     format!(" Last API request  : {}", last_url)
