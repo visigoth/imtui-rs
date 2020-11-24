@@ -37,6 +37,7 @@ use clap::Clap;
 use eyre::{WrapErr, Result};
 use serde::{Deserialize};
 use serde_json::Value;
+use timeago;
 
 mod hn;
 
@@ -70,6 +71,7 @@ struct WindowData {
     title: String,
     window_content: WindowContent,
     hn_state: Rc<RefCell<HnState>>,
+    active: bool,
     show_comments: bool,
     selected_story_id: Option<HnItemId>,
     hovered_story_id: Option<HnItemId>,
@@ -83,6 +85,7 @@ impl WindowData {
             title: String::from("[Y] Hacker News"),
             window_content: window_content,
             hn_state: Rc::clone(hn_state),
+            active: false,
             show_comments: false,
             selected_story_id: None,
             hovered_story_id: None,
@@ -91,7 +94,11 @@ impl WindowData {
         }
     }
 
-    fn render(&self, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
+    fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
+
+    fn render(&self, state: &AppState, draw_context: &DrawContext, pos: &(f32, f32), size: &(f32, f32)) {
         let title = imgui::ImString::new(&self.title);
         let window = imgui::Window::new(&title)
             .position([pos.0, pos.1], imgui::Condition::Always)
@@ -105,8 +112,96 @@ impl WindowData {
             draw_context.ui.text("");
 
             // Draw a specific story or draw the index
+            if self.show_comments {
+                self.render_single_story(draw_context, &window_token, pos, size);
+            } else {
+                self.render_index(state, draw_context, &window_token, pos, size);
+            }
+
             window_token.end(draw_context.ui);
         }
+    }
+
+    fn render_index(&self, state: &AppState, draw_context: &DrawContext, window_token: &imgui::WindowToken, pos: &(f32, f32), size: &(f32, f32)) {
+        let hn_state = self.hn_state.borrow();
+        if hn_state.last_list_refresh.is_none() {
+            return;
+        }
+
+        let last_list_refresh = hn_state.last_list_refresh.as_ref().unwrap();
+        let story_ids = match self.window_content {
+            WindowContent::Top => &last_list_refresh.top_ids,
+            WindowContent::Show => &last_list_refresh.show_ids,
+            WindowContent::Ask => &last_list_refresh.ask_ids,
+            WindowContent::New => &last_list_refresh.new_ids,
+        };
+
+        let num_to_show = (self.max_stories as usize).min(story_ids.len());
+        let ui = &draw_context.ui;
+        for (i, story_id) in story_ids[..num_to_show].iter().enumerate() {
+            // TODO: draw jobs too?
+            if let Some(story) = match hn_state.items.borrow().get(story_id) {
+                Some(item) => match item {
+                    HnItem::Story(story) => Some(story),
+                    _ => None,
+                },
+                None => {
+                    hn_state.items_to_fetch.queue_item(*story_id);
+                    None
+                }
+            } {
+                let color_stack = match self.hovered_story_id {
+                    Some(hovered_story_id) => {
+                        if self.active && hovered_story_id == *story_id {
+                            let style = ui.clone_style();
+                            let text_color = ui.push_style_color(
+                                imgui::StyleColor::Text,
+                                style[imgui::StyleColor::WindowBg]
+                            );
+                            let background_color = ui.push_style_color(
+                                imgui::StyleColor::WindowBg,
+                                style[imgui::StyleColor::Text]
+                            );
+
+                            let mut p0 = ui.cursor_screen_pos();
+                            p0[0] = p0[0] + 1.0;
+                            let mut p1 = p0;
+                            p1[0] = p1[0] + ui.calc_text_size(&imgui::ImString::new(&story.title), false, -1.0)[0] + 4.0;
+
+                            let draw_list = ui.get_window_draw_list();
+                            draw_list.add_rect(p0, p1, style[imgui::StyleColor::Text]).build();
+
+                            Some((text_color, background_color))
+                        } else {
+                            None
+                        }
+                    },
+                    None => None
+                };
+
+                ui.text(format!("{:2}.", i+1));
+                ui.same_line(0.0);
+                let wrap_pos = ui.push_text_wrap_pos(ui.content_region_avail()[0]);
+                ui.text(&story.title);
+
+
+                wrap_pos.pop(ui);
+                ui.same_line(0.0);
+                if let Some(color_stack) = color_stack {
+                    color_stack.1.pop(ui);
+                    color_stack.0.pop(ui);
+                }
+
+                ui.text_disabled(format!(" ({})", &story.domain));
+                if state.view_mode != StoryListViewMode::Micro {
+                    let since = timeago::Formatter::new().convert_chrono(story.time, Utc::now());
+                    ui.text_disabled(format!("    {} points by {} {} | {} comments", story.score, &story.by, &since, story.descendants))
+                }
+            }
+        }
+    }
+
+    fn render_single_story(&self, draw_context: &DrawContext, window_token: &imgui::WindowToken, pos: &(f32, f32), size: &(f32, f32)) {
     }
 }
 
@@ -427,7 +522,7 @@ impl HnState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum StoryListViewMode {
     Micro,
     Normal,
@@ -480,6 +575,7 @@ struct AppState {
     hn_state: Rc<RefCell<HnState>>,
     list_update_status: Rc<RefCell<UpdateStatus>>,
     show_status_window: bool,
+    active_window: Option<usize>,
     view_mode: StoryListViewMode,
 }
 
@@ -495,6 +591,7 @@ impl AppState {
             hn_state: hn_state,
             list_update_status: Rc::new(RefCell::new(UpdateStatus::new())),
             show_status_window: true,
+            active_window: Some(0),
             view_mode: StoryListViewMode::Normal,
         }
     }
@@ -541,6 +638,33 @@ impl AppState {
                 update_status_ref.borrow_mut().set_last_update(Instant::now());
             };
             tokio::task::spawn_local(fetch_and_assign);
+        }
+
+        let active_window = self.active_window;
+        for (i, window) in self.windows.iter_mut().enumerate() {
+            let active = match active_window {
+                Some(index) => i == index,
+                _ => false,
+            };
+            window.set_active(active);
+        }
+
+        // Update selected story id
+        if let Some(last_list_refresh) = &self.hn_state.borrow().last_list_refresh {
+            for window in self.windows.iter_mut() {
+                let story_ids = match window.window_content {
+                    WindowContent::Top => &last_list_refresh.top_ids,
+                    WindowContent::Show => &last_list_refresh.show_ids,
+                    WindowContent::Ask => &last_list_refresh.ask_ids,
+                    WindowContent::New => &last_list_refresh.new_ids,
+                };
+
+                // TODO: detect when selected story id is no longer in the data
+                // TODO: detect when selected story id would no longer be visible on screen
+                if window.hovered_story_id.is_none() {
+                    window.hovered_story_id = Some(story_ids[0]);
+                }
+            }
         }
     }
 }
@@ -618,7 +742,7 @@ impl HntermApp {
                 if i != num_windows - 1 {
                     actual_window_size.0 = (actual_window_size.0 - 1.1).floor();
                 }
-                wd.render(draw_context, &window_pos, &actual_window_size);
+                wd.render(state, draw_context, &window_pos, &actual_window_size);
                 window_pos.0 = (window_pos.0 + window_width).ceil();
             }
         }
