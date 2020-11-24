@@ -7,6 +7,7 @@ extern crate maplit;
 extern crate debug_here;
 
 use imtui;
+use std::collections::HashSet;
 use futures::future;
 use futures::stream::{self, Stream, StreamExt};
 use std::task::Waker;
@@ -399,29 +400,42 @@ impl HnApiClient {
     }
 }
 
-struct ItemFetchQueue(Rc<RefCell<VecDeque<HnItemId>>>, Rc<RefCell<Option<Waker>>>);
+struct ItemFetchQueue {
+    queue: Rc<RefCell<VecDeque<HnItemId>>>,
+    pending: RefCell<HashSet<HnItemId>>,
+    waker: Rc<RefCell<Option<Waker>>>,
+}
 
 impl ItemFetchQueue {
     fn new() -> ItemFetchQueue {
-        ItemFetchQueue(Rc::new(RefCell::new(VecDeque::new())), Rc::new(RefCell::new(None)))
+        ItemFetchQueue {
+            queue: Rc::new(RefCell::new(VecDeque::new())),
+            pending: RefCell::new(HashSet::new()),
+            waker: Rc::new(RefCell::new(None)),
+        }
     }
 
     fn queue_item(&self, item_id: HnItemId) {
-        self.0.borrow_mut().push_back(item_id);
-        self.wake()
+        if !self.pending.borrow().contains(&item_id) {
+            self.pending.borrow_mut().insert(item_id);
+            self.queue.borrow_mut().push_back(item_id);
+            self.wake();
+        }
     }
 
     fn queue_items<'a>(&mut self, items: impl IntoIterator<Item = &'a HnItemId>) {
-        self.0.borrow_mut().extend(items);
+        let new = items.into_iter().filter(|&x| !self.pending.borrow().contains(x)).map(|&x| x).collect::<Vec<HnItemId>>();
+        self.pending.borrow_mut().extend(new.clone());
+        self.queue.borrow_mut().extend(new.clone());
         self.wake()
     }
 
     fn len(&self) -> usize {
-        self.0.borrow().len()
+        self.pending.borrow().len()
     }
 
     fn wake(&self) {
-        let w = self.1.borrow();
+        let w = self.waker.borrow();
         match &*w {
             Some(waker) => waker.wake_by_ref(),
             None => ()
@@ -429,8 +443,9 @@ impl ItemFetchQueue {
     }
 
     fn start(&self, hn_api: Rc<RefCell<HnApiClient>>, items: Rc<RefCell<HashMap<HnItemId, HnItem>>>) -> JoinHandle<()> {
-        let item_ids_rc = self.0.clone();
-        let waker_rc = self.1.clone();
+        let item_ids_rc = self.queue.clone();
+        let waker_rc = self.waker.clone();
+        let pending_rc = self.pending.clone();
         let fut = stream::poll_fn(move |cx| {
             match item_ids_rc.borrow_mut().pop_front() {
                 Some(id) => Poll::Ready(Some(id)),
@@ -442,10 +457,10 @@ impl ItemFetchQueue {
         }).map(move |id| {
             let c = hn_api.clone();
             async move {
-                c.borrow().fetch_item(id).await
+                (id, c.borrow().fetch_item(id).await)
             }
         }).buffer_unordered(10)
-            .for_each(move |result| {
+            .for_each(move |(id, result)| {
                 match result {
                     Ok(item) => {
                         // Need a copy in order to move the value into the map (without Rc).
@@ -462,6 +477,7 @@ impl ItemFetchQueue {
                     },
                     _ => {}
                 };
+                pending_rc.borrow_mut().remove(&id);
                 future::ready(())
             });
         tokio::task::spawn_local(fut)
@@ -473,10 +489,10 @@ impl Stream for ItemFetchQueue {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let state = self.get_mut();
-        match state.0.borrow_mut().pop_front() {
+        match state.queue.borrow_mut().pop_front() {
             Some(id) => Poll::Ready(Some(id)),
             None => {
-                state.1.borrow_mut().replace(cx.waker().clone());
+                state.waker.borrow_mut().replace(cx.waker().clone());
                 Poll::Pending
             }
         }
