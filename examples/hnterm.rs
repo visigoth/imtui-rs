@@ -322,7 +322,11 @@ impl HnItem {
         match &value["type"] {
             Value::String(s) => {
                 match s.as_str() {
-                    "story" => Ok(HnItem::Story(serde_json::from_value::<HnStoryItem>(value)?)),
+                    "story" => {
+                        let mut story = serde_json::from_value::<HnStoryItem>(value)?;
+                        story.domain = reqwest::Url::parse(&story.url)?.host_str().unwrap_or(&story.domain).to_string();
+                        Ok(HnItem::Story(story))
+                    },
                     "job" => Ok(HnItem::Job(serde_json::from_value::<HnJobItem>(value)?)),
                     "comment" => Ok(HnItem::Comment(serde_json::from_value::<HnCommentItem>(value)?)),
                     "poll" => Ok(HnItem::Poll(serde_json::from_value::<HnPollItem>(value)?)),
