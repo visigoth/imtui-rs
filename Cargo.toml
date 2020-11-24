@@ -1,11 +1,14 @@
 [package]
 name = "imtui"
 version = "0.1.0"
-authors = ["Shaheen Gandhi <shaheen@oculus.com>"]
+authors = ["Shaheen Gandhi <visigoth@gmail.com>"]
 description = "High-level Rust bindings for imtui"
+keywords = ["terminal", "TUI", "FFI", "imtui", "Dear ImGui", "imgui"]
 categories = ["api-bindings"]
 edition = "2018"
 readme = "README.md"
+license = "MIT"
+repository = "https://github.com/visigoth/imtui-rs"
 
 [dependencies]
 imtui-sys = { version = "0.1.0", path = "imtui-sys" }
