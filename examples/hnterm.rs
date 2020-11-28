@@ -77,7 +77,7 @@ struct WindowData {
     selected_story_id: Option<HnItemId>,
     hovered_story_id: Option<HnItemId>,
     hovered_comment_id: Option<HnItemId>,
-    max_stories: u32,
+    max_stories: Cell<u32>,
 }
 
 impl WindowData {
@@ -91,7 +91,7 @@ impl WindowData {
             selected_story_id: None,
             hovered_story_id: None,
             hovered_comment_id: None,
-            max_stories: 10,
+            max_stories: Cell::new(10),
         }
     }
 
@@ -137,7 +137,7 @@ impl WindowData {
             WindowContent::New => &last_list_refresh.new_ids,
         };
 
-        let num_to_show = (self.max_stories as usize).min(story_ids.len());
+        let num_to_show = (self.max_stories.get() as usize).min(story_ids.len());
         let ui = &draw_context.ui;
         for (i, story_id) in story_ids[..num_to_show].iter().enumerate() {
             // TODO: draw jobs too?
@@ -197,6 +197,16 @@ impl WindowData {
                 if state.view_mode != StoryListViewMode::Micro {
                     let since = timeago::Formatter::new().convert_chrono(story.time, Utc::now());
                     ui.text_disabled(format!("    {} points by {} {} | {} comments", story.score, &story.by, &since, story.descendants))
+                }
+
+                let screen_pos = ui.cursor_screen_pos();
+                if screen_pos[1] + 3.0 > size.1 {
+                    self.max_stories.set((i + 1) as u32);
+                    break;
+                } else {
+                    if i == (self.max_stories.get() - 1) as usize && screen_pos[1] + 2.0 < size.1 {
+                        self.max_stories.set(self.max_stories.get() + 1);
+                    }
                 }
             }
         }
@@ -402,7 +412,7 @@ impl HnApiClient {
 
 struct ItemFetchQueue {
     queue: Rc<RefCell<VecDeque<HnItemId>>>,
-    pending: RefCell<HashSet<HnItemId>>,
+    pending: Rc<RefCell<HashSet<HnItemId>>>,
     waker: Rc<RefCell<Option<Waker>>>,
 }
 
@@ -410,7 +420,7 @@ impl ItemFetchQueue {
     fn new() -> ItemFetchQueue {
         ItemFetchQueue {
             queue: Rc::new(RefCell::new(VecDeque::new())),
-            pending: RefCell::new(HashSet::new()),
+            pending: Rc::new(RefCell::new(HashSet::new())),
             waker: Rc::new(RefCell::new(None)),
         }
     }
@@ -448,19 +458,19 @@ impl ItemFetchQueue {
         let pending_rc = self.pending.clone();
         let fut = stream::poll_fn(move |cx| {
             match item_ids_rc.borrow_mut().pop_front() {
-                Some(id) => Poll::Ready(Some(id)),
+                Some(item_id) => Poll::Ready(Some(item_id)),
                 None => {
                     waker_rc.borrow_mut().replace(cx.waker().clone());
                     Poll::Pending
                 }
             }
-        }).map(move |id| {
+        }).map(move |item_id| {
             let c = hn_api.clone();
             async move {
-                (id, c.borrow().fetch_item(id).await)
+                (item_id, c.borrow().fetch_item(item_id).await)
             }
         }).buffer_unordered(10)
-            .for_each(move |(id, result)| {
+            .for_each(move |(item_id, result)| {
                 match result {
                     Ok(item) => {
                         // Need a copy in order to move the value into the map (without Rc).
@@ -477,7 +487,7 @@ impl ItemFetchQueue {
                     },
                     _ => {}
                 };
-                pending_rc.borrow_mut().remove(&id);
+                pending_rc.borrow_mut().remove(&item_id);
                 future::ready(())
             });
         tokio::task::spawn_local(fut)
