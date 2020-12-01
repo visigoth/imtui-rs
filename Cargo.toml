@@ -14,6 +14,8 @@ repository = "https://github.com/visigoth/imtui-rs"
 imtui-sys = { version = "0.1.0", path = "imtui-sys" }
 imgui = { version = "0.2.1", path = "imgui-rs" }
 timeago = "0.2.1"
+log = "0.4.11"
+env_logger = "0.8.2"
 
 [dev-dependencies]
 variant_count = "*"

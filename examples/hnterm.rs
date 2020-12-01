@@ -39,6 +39,8 @@ use eyre::{WrapErr, Result};
 use serde::{Deserialize};
 use serde_json::Value;
 use timeago;
+use log;
+use env_logger;
 
 mod hn;
 
@@ -429,6 +431,7 @@ impl ItemFetchQueue {
 
     fn queue_item(&self, item_id: HnItemId) {
         if !self.pending.borrow().contains(&item_id) {
+            log::trace!(target: "fetch_queue", "queued {}", item_id);
             self.pending.borrow_mut().insert(item_id);
             self.queue.borrow_mut().push_back(item_id);
             self.wake();
@@ -439,6 +442,7 @@ impl ItemFetchQueue {
         let new = items.into_iter().filter(|&x| !self.pending.borrow().contains(x)).map(|&x| x).collect::<Vec<HnItemId>>();
         self.pending.borrow_mut().extend(new.clone());
         self.queue.borrow_mut().extend(new.clone());
+        new.into_iter().for_each(|x| log::trace!(target: "fetch_queue", "queued {}", x));
         self.wake()
     }
 
@@ -460,7 +464,10 @@ impl ItemFetchQueue {
         let pending_rc = self.pending.clone();
         let fut = stream::poll_fn(move |cx| {
             match item_ids_rc.borrow_mut().pop_front() {
-                Some(item_id) => Poll::Ready(Some(item_id)),
+                Some(item_id) => {
+                    log::trace!(target: "fetch_queue", "dequeued {}", item_id);
+                    Poll::Ready(Some(item_id))
+                },
                 None => {
                     waker_rc.borrow_mut().replace(cx.waker().clone());
                     Poll::Pending
@@ -469,12 +476,14 @@ impl ItemFetchQueue {
         }).map(move |item_id| {
             let c = hn_api.clone();
             async move {
+                log::trace!(target: "fetch_queue", "starting fetch for {}", item_id);
                 (item_id, c.borrow().fetch_item(item_id).await)
             }
         }).buffer_unordered(10)
             .for_each(move |(item_id, result)| {
                 match result {
                     Ok(item) => {
+                        log::trace!(target: "fetch_queue", "successfully fetched {}", item_id);
                         // Need a copy in order to move the value into the map (without Rc).
                         let item_clone = item.clone();
                         let mut item_map = items.borrow_mut();
@@ -484,10 +493,14 @@ impl ItemFetchQueue {
                             HnItem::Job(job) => { item_map.insert(job.id, item_clone); }
                             HnItem::Poll(poll) => { item_map.insert(poll.id, item_clone); }
                             HnItem::PollOpt(pollopt) => { item_map.insert(pollopt.id, item_clone); }
-                            _ => {}
+                            _ => {
+                                log::trace!(target: "fetch_queue", "received unknown item type");
+                            }
                         }
                     },
-                    _ => {}
+                    Err(e) => {
+                        log::error!(target: "fetch_queue", "failed to fetch {}: {:?}", item_id, e);
+                    }
                 };
                 pending_rc.borrow_mut().remove(&item_id);
                 future::ready(())
@@ -866,6 +879,13 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
     if opts.debug {
         debug_here!();
     }
+
+    let mut log_builder = env_logger::Builder::new();
+    log_builder.target(env_logger::Target::Stderr)
+        .filter_module("fetch_queue", log::LevelFilter::Trace)
+        .filter_module("reqwest::connect", log::LevelFilter::Trace)
+        .filter_module("reqwest::async_impl::client", log::LevelFilter::Trace)
+        .init();
 
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
