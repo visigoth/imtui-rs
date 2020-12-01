@@ -42,8 +42,6 @@ use timeago;
 use log;
 use env_logger;
 
-mod hn;
-
 #[derive(VariantCount, PartialEq, Eq, Hash, Clone)]
 enum WindowContent {
     Top,
