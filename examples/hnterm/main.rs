@@ -868,7 +868,9 @@ fn set_color_scheme(context: &mut imgui::Context, dark: bool) {
 #[derive(Clap)]
 struct Opts {
     #[clap(short, long, about = "Wait for debugger at startup")]
-    debug: bool
+    debug: bool,
+    #[clap(short, long, about = "Verbose logging to stderr")]
+    verbose: bool,
 }
 
 #[tokio::main]
@@ -878,12 +880,14 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
         debug_here!();
     }
 
-    let mut log_builder = env_logger::Builder::new();
-    log_builder.target(env_logger::Target::Stderr)
-        .filter_module("fetch_queue", log::LevelFilter::Trace)
-        .filter_module("reqwest::connect", log::LevelFilter::Trace)
-        .filter_module("reqwest::async_impl::client", log::LevelFilter::Trace)
-        .init();
+    if opts.verbose {
+        let mut log_builder = env_logger::Builder::new();
+        log_builder.target(env_logger::Target::Stderr)
+            .filter_module("fetch_queue", log::LevelFilter::Trace)
+            .filter_module("reqwest::connect", log::LevelFilter::Trace)
+            .filter_module("reqwest::async_impl::client", log::LevelFilter::Trace)
+            .init();
+    }
 
     let mut imgui = imgui::Context::create();
     imgui.set_ini_filename(None);
