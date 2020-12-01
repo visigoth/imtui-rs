@@ -245,6 +245,7 @@ struct HnCommentItem {
     id: HnItemId,
     by: String,
     score: i32,
+    #[serde(with = "chrono::serde::ts_seconds")]
     time: DateTime<Utc>,
     text: String,
     children: Vec<HnItemId>,
@@ -257,6 +258,7 @@ struct HnJobItem {
     id: HnItemId,
     by: String,
     score: i32,
+    #[serde(with = "chrono::serde::ts_seconds")]
     time: DateTime<Utc>,
     title: String,
     url: String,
