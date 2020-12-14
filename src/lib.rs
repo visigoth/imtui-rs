@@ -46,8 +46,10 @@ impl Ncurses {
             sys::ImTui_ImplNcurses_DrawScreen(self.is_active);
         }
     }
+}
 
-    pub fn drop(&mut self) {
+impl Drop for Ncurses {
+    fn drop(&mut self) {
         unsafe {
             sys::ImTui_ImplText_Shutdown();
             sys::ImTui_ImplNcurses_Shutdown();
