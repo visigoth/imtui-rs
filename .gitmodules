@@ -1,6 +1,6 @@
 [submodule "imtui-sys/third-party/imtui"]
 	path = imtui-sys/third-party/imtui
-	url = git@github.com:visigoth/imtui.git
+	url = https://github.com/visigoth/imtui
 [submodule "imgui-rs"]
 	path = imgui-rs
 	url = https://github.com/Gekkio/imgui-rs
